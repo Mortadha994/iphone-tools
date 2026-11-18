@@ -100,7 +100,33 @@ CSS = f"""
 .backup-card progressbar trough {{ min-height: 8px; border-radius: 99px; }}
 .backup-card progressbar progress {{ min-height: 8px; border-radius: 99px; background: {BLUE}; }}
 .empty-title {{ font-size: 1.6em; font-weight: 800; }}
+.dropzone {{
+  border: 2px dashed alpha(currentColor, 0.22);
+  border-radius: 22px;
+  padding: 26px 18px;
+  transition: border-color 200ms ease, background 200ms ease;
+}}
+.dropzone.hover {{ border-color: {BLUE}; background: alpha({BLUE}, 0.12); }}
+.dropzone image {{ transition: -gtk-icon-transform 320ms cubic-bezier(.2, .9, .3, 1.5); }}
+.dropzone.hover image {{ -gtk-icon-transform: scale(1.22) rotate(-8deg); }}
+.dropzone .big {{ font-size: 1.15em; font-weight: 800; }}
+.hint-card {{ border-radius: 14px; padding: 12px 14px; background: alpha({GREEN}, 0.13); }}
+.copy-card {{ border-radius: 18px; padding: 14px 16px; background: alpha({BLUE}, 0.12);
+              border: 1px solid alpha({BLUE}, 0.40); }}
+.copy-card progressbar trough {{ min-height: 8px; border-radius: 99px; }}
+.copy-card progressbar progress {{ min-height: 8px; border-radius: 99px; background: {BLUE}; }}
+.note-bounce {{ animation: float 0.9s ease-in-out infinite alternate; }}
 """
+
+# Apps that read songs from their "iTunes File Sharing" folder, with how to see them on the phone.
+KNOWN_MUSIC_APPS = {
+    "com.spotify.client": ("spotify",
+                           "On the iPhone open Spotify → Settings, search “Local files” and turn on "
+                           "“Show audio files from this device”. Songs appear in Your Library → Local Files."),
+    "org.videolan.vlc-ios": ("vlc", "Songs appear in VLC’s Audio tab."),
+}
+AUDIO_EXT = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".aif", ".aiff", ".alac", ".ogg", ".opus", ".mp4"}
+MOUNT_DIR = os.path.expanduser("~/.cache/iphone-tools/mnt")
 
 
 def rgba(colour, alpha=1.0):
@@ -300,6 +326,406 @@ def revealer(child):
     return r
 
 
+# ---------------------------------------------------------------- music (app file sharing)
+def list_share_apps(udid):
+    """Apps on the phone that accept files from a computer: [(bundle_id, name)]."""
+    rc, out, _ = run(["ifuse", "-u", udid, "--list-apps"], timeout=30)
+    apps = []
+    for line in out.decode(errors="replace").splitlines():
+        m = re.match(r'\s*([^,]+),\s*"[^"]*",\s*"(.*)"\s*$', line)
+        if m and m.group(1) != "CFBundleIdentifier":
+            apps.append((m.group(1).strip(), m.group(2)))
+    # known music players first, Spotify at the top
+    apps.sort(key=lambda a: (a[0] not in KNOWN_MUSIC_APPS, a[0] != "com.spotify.client", a[1].lower()))
+    return apps
+
+
+class AppDocs:
+    """`with AppDocs(udid, app_id) as path:` mounts an app's Documents folder via ifuse."""
+
+    def __init__(self, udid, app_id):
+        self.udid, self.app_id, self.path = udid, app_id, MOUNT_DIR
+
+    def __enter__(self):
+        os.makedirs(self.path, exist_ok=True)
+        subprocess.run(["fusermount", "-uz", self.path], capture_output=True)  # clear a stale mount
+        rc, _, err = run(["ifuse", "-u", self.udid, "--documents", self.app_id, self.path], timeout=30)
+        if rc != 0:
+            raise RuntimeError(err.strip() or "Could not open the app folder on the iPhone")
+        return self.path
+
+    def __exit__(self, *exc):
+        for _ in range(5):
+            if subprocess.run(["fusermount", "-u", self.path], capture_output=True).returncode == 0:
+                break
+            time.sleep(0.4)
+        else:
+            subprocess.run(["fusermount", "-uz", self.path], capture_output=True)
+        return False
+
+
+def collect_audio(paths):
+    """Expand files/folders into a sorted list of audio files."""
+    found = []
+    for p in paths:
+        if os.path.isdir(p):
+            for root, _dirs, files in os.walk(p):
+                found += [os.path.join(root, f) for f in files if os.path.splitext(f)[1].lower() in AUDIO_EXT]
+        elif os.path.splitext(p)[1].lower() in AUDIO_EXT:
+            found.append(p)
+    return sorted(dict.fromkeys(found), key=lambda f: os.path.basename(f).lower())
+
+
+class MusicWindow(Adw.Window):
+    def __init__(self, parent, udid):
+        super().__init__(transient_for=parent, modal=True, title="Add music", default_width=560, default_height=760)
+        self.parent, self.udid = parent, udid
+        self.apps, self.busy, self.cancel = [], False, False
+        self.song_rows = []
+        self.lock = threading.Lock()
+
+        self.toasts = Adw.ToastOverlay()
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(title="Add music", subtitle="From this PC to your iPhone"))
+        self.spinner = Gtk.Spinner()
+        header.pack_start(self.spinner)
+        view.add_top_bar(header)
+
+        clamp = Adw.Clamp(maximum_size=620)
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16,
+                      margin_top=14, margin_bottom=24, margin_start=16, margin_end=16)
+        clamp.set_child(col)
+        sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        sc.set_child(clamp)
+        view.set_content(sc)
+        self.toasts.set_child(view)
+        self.set_content(self.toasts)
+
+        # target app
+        tgt = Adw.PreferencesGroup(title="Send songs to")
+        self.combo = Adw.ComboRow(title="Music app", model=Gtk.StringList.new(["Loading apps…"]), sensitive=False)
+        self.app_icon = Gtk.Image(icon_name="org.gnome.Music", pixel_size=32)
+        self.combo.add_prefix(self.app_icon)
+        self.combo.connect("notify::selected", lambda *_: self._target_changed())
+        tgt.add(self.combo)
+        col.append(tgt)
+        self.hint = Gtk.Label(wrap=True, xalign=0, css_classes=["hint-card"])
+        self.hint_rev = revealer(self.hint)
+        col.append(self.hint_rev)
+
+        # drop zone
+        dz = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, css_classes=["dropzone"])
+        self.dz = dz
+        self.dz_icon = Gtk.Image(icon_name="org.gnome.Music", pixel_size=72, css_classes=["float-icon"])
+        dz.append(self.dz_icon)
+        dz.append(Gtk.Label(label="Drop songs or a folder here", css_classes=["big"]))
+        dz.append(Gtk.Label(label="MP3 · M4A · AAC · WAV · FLAC …", css_classes=["caption", "dim-label"]))
+        btns = Gtk.Box(spacing=10, halign=Gtk.Align.CENTER, margin_top=6)
+        self.pick_files = Gtk.Button(label="Choose songs…", css_classes=["pill", "suggested-action"])
+        self.pick_files.connect("clicked", self._choose_files)
+        self.pick_dir = Gtk.Button(label="Choose folder…", css_classes=["pill"])
+        self.pick_dir.connect("clicked", self._choose_folder)
+        btns.append(self.pick_files)
+        btns.append(self.pick_dir)
+        dz.append(btns)
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.connect("enter", lambda *_: (dz.add_css_class("hover"), Gdk.DragAction.COPY)[1])
+        drop.connect("leave", lambda *_: dz.remove_css_class("hover"))
+        drop.connect("drop", self._on_drop)
+        dz.add_controller(drop)
+        col.append(dz)
+
+        # copy progress
+        cc = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, css_classes=["copy-card"])
+        top = Gtk.Box(spacing=10)
+        top.append(Gtk.Image(icon_name="audio-x-generic", pixel_size=30, css_classes=["note-bounce"]))
+        t = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+        self.cp_title = Gtk.Label(xalign=0, css_classes=["section-title"])
+        self.cp_line = Gtk.Label(xalign=0, css_classes=["caption", "dim-label"], ellipsize=Pango.EllipsizeMode.MIDDLE)
+        t.append(self.cp_title)
+        t.append(self.cp_line)
+        top.append(t)
+        stop = Gtk.Button(label="Cancel", valign=Gtk.Align.CENTER, css_classes=["pill"])
+        stop.connect("clicked", lambda *_: setattr(self, "cancel", True))
+        top.append(stop)
+        cc.append(top)
+        self.cp_bar = Gtk.ProgressBar()
+        cc.append(self.cp_bar)
+        self.copy_rev = revealer(cc)
+        self.copy_rev.set_visible(False)
+        col.append(self.copy_rev)
+
+        # songs already on the phone
+        self.songs = Adw.PreferencesGroup(title="On your iPhone")
+        self.count_lbl = Gtk.Label(css_classes=["dim-label"])
+        self.songs.set_header_suffix(self.count_lbl)
+        col.append(self.songs)
+
+        self.connect("close-request", self._on_close)
+        self._set_busy(True)
+        threading.Thread(target=self._load_apps, daemon=True).start()
+
+    # --- helpers
+    def toast(self, msg):
+        self.toasts.add_toast(Adw.Toast(title=msg, timeout=4))
+
+    def _set_busy(self, busy):
+        self.busy = busy
+        (self.spinner.start if busy else self.spinner.stop)()
+        for w in (self.pick_files, self.pick_dir):
+            w.set_sensitive(not busy and bool(self.apps))
+        self.combo.set_sensitive(not busy and bool(self.apps))
+
+    def app_id(self):
+        i = self.combo.get_selected()
+        return self.apps[i][0] if 0 <= i < len(self.apps) else None
+
+    def _on_close(self, *_):
+        if self.busy:
+            self.cancel = True
+        return False
+
+    # --- target apps
+    def _load_apps(self):
+        apps = list_share_apps(self.udid)
+        GLib.idle_add(self._apps_loaded, apps)
+
+    def _apps_loaded(self, apps):
+        self.apps = apps
+        if not apps:
+            self.combo.set_model(Gtk.StringList.new(["No compatible app on the iPhone"]))
+            self.hint.set_label("Install a music player that accepts files from a computer "
+                                "(for example Spotify or VLC) from the App Store, then reopen this window.")
+            self.hint_rev.set_reveal_child(True)
+            self._set_busy(False)
+            return False
+        names = [n + ("  ♪" if a in KNOWN_MUSIC_APPS else "") for a, n in apps]
+        self.combo.set_model(Gtk.StringList.new(names))
+        self.combo.set_selected(0)
+        self._set_busy(False)
+        self._target_changed()
+        return False
+
+    def _target_changed(self):
+        aid = self.app_id()
+        if not aid:
+            return
+        icon, hint = KNOWN_MUSIC_APPS.get(
+            aid, ("org.gnome.Music", "Songs go to this app’s folder (Files → On My iPhone). "
+                                     "The app must be able to play files from there."))
+        theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+        self.app_icon.set_from_icon_name(icon if theme.has_icon(icon) else "org.gnome.Music")
+        self.hint_rev.set_reveal_child(False)
+        self.hint.set_label("💡 " + hint)
+        GLib.timeout_add(180, lambda: (self.hint_rev.set_reveal_child(True), False)[1])
+        self.refresh_songs()
+
+    # --- song list
+    def refresh_songs(self):
+        aid = self.app_id()
+        if not aid or self.busy:
+            return
+        self._set_busy(True)
+        threading.Thread(target=self._list_worker, args=(aid,), daemon=True).start()
+
+    def _list_worker(self, aid):
+        songs, err = [], None
+        try:
+            with self.lock, AppDocs(self.udid, aid) as mnt:
+                for root, _d, files in os.walk(mnt):
+                    for f in files:
+                        if os.path.splitext(f)[1].lower() in AUDIO_EXT:
+                            full = os.path.join(root, f)
+                            songs.append((os.path.relpath(full, mnt), os.path.getsize(full)))
+        except Exception as e:  # noqa: BLE001
+            err = str(e)
+        GLib.idle_add(self._show_songs, sorted(songs, key=lambda s: s[0].lower()), err)
+
+    def _show_songs(self, songs, err):
+        self._set_busy(False)
+        for r in self.song_rows:
+            self.songs.remove(r)
+        self.song_rows = []
+        if err:
+            self.toast(f"Could not read the iPhone: {err[:80]}")
+        total = sum(s for _, s in songs)
+        self.count_lbl.set_label(f"{len(songs)} songs · {total / 1e6:.0f} MB" if songs else "")
+        if not songs:
+            r = Adw.ActionRow(title="No songs yet", subtitle="Drop some music above to get started")
+            r.add_prefix(Gtk.Image(icon_name="audio-x-generic", pixel_size=28, opacity=0.5))
+            self.songs.add(r)
+            self.song_rows.append(r)
+        for rel, size in songs:
+            name = os.path.splitext(os.path.basename(rel))[0]
+            r = Adw.ActionRow(title=GLib.markup_escape_text(name),
+                              subtitle=f"{size / 1e6:.1f} MB · {os.path.splitext(rel)[1][1:].upper()}")
+            r.add_prefix(Gtk.Image(icon_name="audio-x-generic", pixel_size=28))
+            rm = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER,
+                            tooltip_text="Remove from iPhone", css_classes=["flat", "circular"])
+            rm.connect("clicked", lambda _b, p=rel, n=name: self._confirm_delete(p, n))
+            r.add_suffix(rm)
+            self.songs.add(r)
+            self.song_rows.append(r)
+        return False
+
+    def _confirm_delete(self, rel, name):
+        d = Adw.MessageDialog(transient_for=self, heading="Remove song?",
+                              body=f"“{name}” will be deleted from your iPhone. The copy on this PC is kept.")
+        d.add_response("cancel", "Cancel")
+        d.add_response("ok", "Remove")
+        d.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE)
+        d.connect("response", lambda _d, r: self._delete(rel) if r == "ok" else None)
+        d.present()
+
+    def _delete(self, rel):
+        aid = self.app_id()
+        self._set_busy(True)
+
+        def worker():
+            err = None
+            try:
+                with self.lock, AppDocs(self.udid, aid) as mnt:
+                    os.remove(os.path.join(mnt, rel))
+            except Exception as e:  # noqa: BLE001
+                err = str(e)
+            GLib.idle_add(self._after_delete, err)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_delete(self, err):
+        self._set_busy(False)
+        self.toast("Song removed" if not err else f"Could not remove: {err[:80]}")
+        self.refresh_songs()
+        return False
+
+    # --- choosing / dropping files
+    def _audio_filter(self):
+        f = Gtk.FileFilter()
+        f.set_name("Music files")
+        for e in sorted(AUDIO_EXT):
+            f.add_suffix(e[1:])
+        store = Gio.ListStore.new(Gtk.FileFilter)
+        store.append(f)
+        return store, f
+
+    def _start_folder(self):
+        music = os.path.expanduser("~/Music")
+        return Gio.File.new_for_path(music if os.path.isdir(music) else os.path.expanduser("~"))
+
+    def _choose_files(self, *_):
+        dlg = Gtk.FileDialog(title="Choose songs", modal=True)
+        store, f = self._audio_filter()
+        dlg.set_filters(store)
+        dlg.set_default_filter(f)
+        dlg.set_initial_folder(self._start_folder())
+
+        def done(d, res):
+            try:
+                files = d.open_multiple_finish(res)
+            except GLib.Error:
+                return  # cancelled
+            self.add_paths([files.get_item(i).get_path() for i in range(files.get_n_items())])
+        dlg.open_multiple(self, None, done)
+
+    def _choose_folder(self, *_):
+        dlg = Gtk.FileDialog(title="Choose a music folder", modal=True)
+        dlg.set_initial_folder(self._start_folder())
+
+        def done(d, res):
+            try:
+                folder = d.select_folder_finish(res)
+            except GLib.Error:
+                return
+            self.add_paths([folder.get_path()])
+        dlg.select_folder(self, None, done)
+
+    def _on_drop(self, _target, value, _x, _y):
+        self.dz.remove_css_class("hover")
+        self.add_paths([f.get_path() for f in value.get_files() if f.get_path()])
+        return True
+
+    # --- copying
+    def add_paths(self, paths):
+        if self.busy:
+            self.toast("Please wait for the current task to finish")
+            return
+        files = collect_audio(paths)
+        if not files:
+            self.toast("No music files found there")
+            return
+        aid = self.app_id()
+        self.cancel = False
+        self._set_busy(True)
+        self.cp_title.set_label(f"Sending {len(files)} song{'s' if len(files) > 1 else ''} to your iPhone…")
+        self.cp_line.set_label("Connecting…")
+        self.cp_bar.set_fraction(0)
+        self.copy_rev.set_visible(True)
+        self.copy_rev.set_reveal_child(True)
+        threading.Thread(target=self._copy_worker, args=(aid, files), daemon=True).start()
+
+    def _copy_worker(self, aid, files):
+        total = sum(os.path.getsize(f) for f in files) or 1
+        done_bytes, copied, skipped, err = 0, 0, 0, None
+        try:
+            with self.lock, AppDocs(self.udid, aid) as mnt:
+                for n, src in enumerate(files, 1):
+                    if self.cancel:
+                        break
+                    name = os.path.basename(src)
+                    dst = os.path.join(mnt, name)
+                    size = os.path.getsize(src)
+                    GLib.idle_add(self._copy_progress, done_bytes / total, f"{n} of {len(files)} · {name}")
+                    if os.path.exists(dst) and os.path.getsize(dst) == size:
+                        skipped += 1
+                        done_bytes += size
+                        continue
+                    part = dst + ".part"
+                    with open(src, "rb") as fi, open(part, "wb") as fo:
+                        while not self.cancel:
+                            chunk = fi.read(1 << 20)
+                            if not chunk:
+                                break
+                            fo.write(chunk)
+                            done_bytes += len(chunk)
+                            GLib.idle_add(self._copy_progress, done_bytes / total, None)
+                    if self.cancel:
+                        os.remove(part)
+                        break
+                    os.replace(part, dst)
+                    copied += 1
+        except Exception as e:  # noqa: BLE001
+            err = str(e)
+        GLib.idle_add(self._copy_done, copied, skipped, len(files), err)
+
+    def _copy_progress(self, frac, line):
+        self.cp_bar.set_fraction(min(frac, 1))
+        if line:
+            self.cp_line.set_label(line)
+        return False
+
+    def _copy_done(self, copied, skipped, total, err):
+        self._set_busy(False)
+        if err:
+            self.cp_title.set_label("Copy stopped")
+            self.cp_line.set_label(err[:120])
+        elif self.cancel:
+            self.cp_title.set_label(f"Cancelled · {copied} of {total} sent")
+        else:
+            self.cp_bar.set_fraction(1)
+            extra = f" · {skipped} already there" if skipped else ""
+            self.cp_title.set_label(f"Done ✔  {copied} song{'s' if copied != 1 else ''} sent{extra}")
+            self.cp_line.set_label("Open the app on your iPhone to play them")
+        self.toast(self.cp_title.get_label())
+
+        def hide():
+            self.copy_rev.set_reveal_child(False)
+            GLib.timeout_add(500, lambda: (self.copy_rev.set_visible(False), False)[1])
+            return False
+        GLib.timeout_add_seconds(6, hide)
+        self.refresh_songs()
+        return False
+
+
 # ---------------------------------------------------------------- window
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
@@ -445,9 +871,10 @@ class Window(Adw.ApplicationWindow):
         # actions
         acard = self.card("Quick actions")
         flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
-                           min_children_per_line=2, max_children_per_line=4, column_spacing=10, row_spacing=10)
+                           min_children_per_line=3, max_children_per_line=3, column_spacing=10, row_spacing=10)
         self.tiles = {}
         for key, title, icon, cb, danger in [
+            ("music", "Add music", "org.gnome.Music", self.open_music, False),
             ("photos", "Photos", "folder-pictures", self.open_photos, False),
             ("files", "App files", "folder-documents", self.open_files, False),
             ("backup", "Back up", "deja-dup", self.backup, False),
@@ -603,6 +1030,8 @@ class Window(Adw.ApplicationWindow):
         self.stack.set_visible_child_name("device")
         if not was_shown:
             stagger_reveal(self.sections)
+            if os.environ.get("IPHONE_TOOLS_OPEN") == "music" and not getattr(self, "music_win", None):
+                GLib.timeout_add(600, lambda: (self.open_music(), False)[1])  # developer aid
         return False
 
     # ---------- actions ----------
@@ -640,6 +1069,12 @@ class Window(Adw.ApplicationWindow):
         except GLib.Error as e:
             self.toast(f"Could not open {what}: unlock the iPhone and try again ({e.message})")
         return False
+
+    def open_music(self, *_):
+        if not self.need_device():
+            return
+        self.music_win = MusicWindow(self, self.udid)
+        self.music_win.present()
 
     def open_photos(self, *_):
         self._open_gvfs("gphoto2", "photos")
@@ -812,6 +1247,7 @@ class App(Adw.Application):
             GLib.timeout_add(int(os.environ.get("IPHONE_TOOLS_SHOT_MS", "4500")), self._shot, win, shot)
 
     def _shot(self, win, path):
+        win = getattr(win, "music_win", None) or win
         w, h = win.get_width(), win.get_height()
         paintable = Gtk.WidgetPaintable(widget=win)
         snap = Gtk.Snapshot()
