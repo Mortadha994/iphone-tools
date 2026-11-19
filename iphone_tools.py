@@ -189,15 +189,28 @@ def themed(name):
     """A GIcon that tries `name` first, then sensible fallbacks, so the app looks right on any icon theme."""
     names = ICON_FALLBACKS.get(name, [name])
     if name == "phone-apple-iphone":
-        # GTK searches the whole system theme for *every* fallback name before hicolor, so a generic
-        # "phone" would beat our own icon. Pick explicitly: theme's iPhone > our installed icon > the
-        # SVG next to this file (running from a fresh clone without ./install.sh).
+        # Pick explicitly, because GTK searches the whole system theme for every fallback name before
+        # hicolor: a full-colour theme iPhone (e.g. WhiteSur) > our own icon (installed, or the SVG next to
+        # this file when running from a fresh clone). Stock Adwaita only has a flat -symbolic outline.
         theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
-        if not theme.has_icon("phone-apple-iphone") and not theme.has_icon("iphone-tools"):
-            local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "iphone-tools.svg")
-            if os.path.exists(local):
-                return Gio.FileIcon.new(Gio.File.new_for_path(local))
+        if _full_colour(theme, "phone-apple-iphone"):
+            return Gio.ThemedIcon.new("phone-apple-iphone")
+        if theme.has_icon("iphone-tools"):
+            return Gio.ThemedIcon.new("iphone-tools")
+        local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "iphone-tools.svg")
+        if os.path.exists(local):
+            return Gio.FileIcon.new(Gio.File.new_for_path(local))
     return Gio.ThemedIcon.new_from_names(names)
+
+
+def _full_colour(theme, name):
+    """True if the theme has a real colour icon for `name` (not just a monochrome -symbolic variant)."""
+    if not theme.has_icon(name):
+        return False
+    paintable = theme.lookup_icon(name, None, 128, 1, Gtk.TextDirection.LTR, 0)
+    f = paintable.get_file()
+    where = (f.get_path() or f.get_uri() or "") if f else ""
+    return bool(where) and "-symbolic" not in where
 
 
 def pt(x, y):
