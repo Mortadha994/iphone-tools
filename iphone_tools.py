@@ -161,6 +161,7 @@ MOUNT_DIR = os.path.expanduser("~/.cache/iphone-tools/mnt")
 MIRROR_NAME = "iPhone Tools"              # name shown in the iPhone's Screen Mirroring list
 MIRROR_PORT = 47800                       # local-only (127.0.0.1) handoff from uxplay to this app
 SHOTS_DIR = os.path.expanduser("~/Pictures/iPhone Screenshots")
+MIRROR_LOG = os.path.expanduser("~/.cache/iphone-tools/uxplay.log")
 
 
 def rgba(colour, alpha=1.0):
@@ -916,7 +917,9 @@ class MirrorWindow(Adw.Window):
             ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
         try:
             self.proc = subprocess.Popen(
-                ["uxplay", "-n", MIRROR_NAME, "-nh", "-p", "-reset", "0", "-vs", sink],
+                # -avdec: decode on the CPU (a VA-API decoder outputs GPU memory, which can't go through
+                #         the socket); -vsync no: don't hold frames for timestamp sync (they never left uxplay)
+                ["uxplay", "-n", MIRROR_NAME, "-nh", "-p", "-reset", "0", "-avdec", "-vsync", "no", "-vs", sink],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, preexec_fn=die_with_app)
         except OSError as e:
             self.show_error("Could not start mirroring", str(e))
@@ -927,10 +930,14 @@ class MirrorWindow(Adw.Window):
 
     def _watch_receiver(self):
         tail = []
-        for raw in iter(self.proc.stdout.readline, b""):
-            line = raw.decode(errors="replace").strip()
-            if line:
-                tail = (tail + [line])[-8:]
+        os.makedirs(os.path.dirname(MIRROR_LOG), exist_ok=True)
+        with open(MIRROR_LOG, "w", encoding="utf-8") as log:  # kept for troubleshooting
+            for raw in iter(self.proc.stdout.readline, b""):
+                line = raw.decode(errors="replace").strip()
+                if line:
+                    log.write(time.strftime("%H:%M:%S ") + line + "\n")
+                    log.flush()
+                    tail = (tail + [line])[-8:]
         rc = self.proc.wait()
         if not self.closing:
             GLib.idle_add(self.show_error, "Mirroring stopped",
