@@ -117,6 +117,36 @@ CSS = f"""
 .copy-card progressbar trough {{ min-height: 8px; border-radius: 99px; }}
 .copy-card progressbar progress {{ min-height: 8px; border-radius: 99px; background: {BLUE}; }}
 .note-bounce {{ animation: float 0.9s ease-in-out infinite alternate; }}
+.mirror-bg {{
+  background-image: radial-gradient(circle at 50% 28%, alpha(#5E5CE6, 0.30), transparent 62%),
+                    linear-gradient(#16161a, #0b0b0d);
+}}
+.phone-frame {{
+  background: #050506;
+  border-radius: 50px;
+  padding: 11px;
+  border: 1px solid alpha(white, 0.14);
+  box-shadow: 0 24px 70px alpha(black, 0.65), inset 0 0 0 2px alpha(white, 0.05);
+}}
+.phone-frame.landscape {{ border-radius: 40px; }}
+.screen {{ border-radius: 40px; background: black; }}
+.phone-frame.landscape .screen {{ border-radius: 30px; }}
+.live-pill {{
+  background: alpha({RED}, 0.92); color: white; border-radius: 99px;
+  padding: 2px 10px; font-weight: 800; font-size: 0.8em;
+}}
+.live-pill label {{ animation: blink 1.2s ease-in-out infinite alternate; }}
+.fps {{ font-size: 0.8em; opacity: 0.6; font-feature-settings: "tnum"; }}
+.step {{ border-radius: 14px; padding: 10px 14px; background: alpha(currentColor, 0.07); }}
+.step-num {{
+  background: {BLUE}; color: white; border-radius: 99px; min-width: 24px; min-height: 24px;
+  font-weight: 800;
+}}
+.mirror-pill {{
+  background: alpha(white, 0.22); color: white; border-radius: 99px; padding: 6px 14px; font-weight: 700;
+  transition: background 180ms ease;
+}}
+.mirror-pill:hover {{ background: alpha(white, 0.34); }}
 """
 
 # Apps that read songs from their "iTunes File Sharing" folder, with how to see them on the phone.
@@ -128,6 +158,10 @@ KNOWN_MUSIC_APPS = {
 }
 AUDIO_EXT = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".aif", ".aiff", ".alac", ".ogg", ".opus", ".mp4"}
 MOUNT_DIR = os.path.expanduser("~/.cache/iphone-tools/mnt")
+MIRROR_NAME = "iPhone Tools"              # name shown in the iPhone's Screen Mirroring list
+MIRROR_PORT = 47800                       # local-only (127.0.0.1) handoff from uxplay to this app
+SHOTS_DIR = os.path.expanduser("~/Pictures/iPhone Screenshots")
+MIRROR_LOG = os.path.expanduser("~/.cache/iphone-tools/uxplay.log")
 
 
 def rgba(colour, alpha=1.0):
@@ -227,10 +261,16 @@ def read_device(udid):
         return d
     d["info"] = parse_info(out)
     d["battery"] = parse_info(run(["ideviceinfo", "-u", udid, "-q", "com.apple.mobile.battery"])[1])
-    # the ".factory" domain has the same totals plus per-category usage (photos...)
-    d["disk"] = parse_info(run(["ideviceinfo", "-u", udid, "-q", "com.apple.disk_usage.factory"])[1])
-    if "TotalDiskCapacity" not in d["disk"]:
-        d["disk"] = parse_info(run(["ideviceinfo", "-u", udid, "-q", "com.apple.disk_usage"])[1])
+    # Ask for each storage value on its own: fetching the whole disk_usage domain can hang for 20 s+
+    # on iOS 26 (one of its internal keys is slow), while single keys answer in ~0.2-1 s.
+    d["disk"] = {}
+    for domain, key in [("com.apple.disk_usage", "TotalDiskCapacity"), ("com.apple.disk_usage", "TotalDataCapacity"),
+                        ("com.apple.disk_usage", "TotalDataAvailable"), ("com.apple.disk_usage", "TotalSystemCapacity"),
+                        ("com.apple.disk_usage.factory", "PhotoUsage")]:
+        rc, out, _ = run(["ideviceinfo", "-u", udid, "-q", domain, "-k", key], timeout=6)
+        value = out.decode(errors="replace").strip()
+        if rc == 0 and value.isdigit():
+            d["disk"][key] = value
     rc, out, _ = run(["idevicediagnostics", "-u", udid, "ioregentry", "AppleSmartBattery"])
     try:
         p = plistlib.loads(out) if rc == 0 and out else {}
@@ -753,6 +793,267 @@ class MusicWindow(Adw.Window):
         return False
 
 
+# ---------------------------------------------------------------- screen mirroring (AirPlay via uxplay)
+def wifi_name():
+    rc, out, _ = run(["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"], timeout=5)
+    for line in out.decode(errors="replace").splitlines():
+        if line.startswith("yes:"):
+            return line[4:]
+    return None
+
+
+class MirrorWindow(Adw.Window):
+    """Shows the iPhone screen live inside the app.
+
+    uxplay (an AirPlay receiver) decodes the stream and, instead of opening its own window, hands the raw
+    frames to us over a private 127.0.0.1 socket (gdppay ! tcpserversink). We read them with an appsink and
+    paint them into a Gtk.Picture inside an iPhone-shaped frame."""
+
+    def __init__(self, parent):
+        super().__init__(transient_for=parent, title="Screen mirroring", default_width=500, default_height=920)
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+        self.Gst = Gst
+        Gst.init(None)
+        self.proc = None
+        self.client = None
+        self.closing = False
+        self.texture = None
+        self.size = (0, 0)
+        self.pending = None
+        self.idle_queued = False
+        self.frames = 0
+        self.lock = threading.Lock()
+
+        self.toasts = Adw.ToastOverlay()
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar(css_classes=["flat"])
+        self.wtitle = Adw.WindowTitle(title="Screen mirroring", subtitle="Starting…")
+        header.set_title_widget(self.wtitle)
+        self.shot_btn = Gtk.Button(icon_name="camera-photo-symbolic", tooltip_text="Screenshot", sensitive=False)
+        self.shot_btn.connect("clicked", self.screenshot)
+        self.fs_btn = Gtk.Button(icon_name="view-fullscreen-symbolic", tooltip_text="Fullscreen")
+        self.fs_btn.connect("clicked", self.toggle_fullscreen)
+        header.pack_end(self.fs_btn)
+        header.pack_end(self.shot_btn)
+        self.live = Gtk.Box(css_classes=["live-pill"], visible=False, valign=Gtk.Align.CENTER)
+        self.live.append(Gtk.Label(label="● LIVE"))
+        header.pack_start(self.live)
+        self.fps_lbl = Gtk.Label(css_classes=["fps"])
+        header.pack_start(self.fps_lbl)
+        view.add_top_bar(header)
+
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, transition_duration=500,
+                               css_classes=["mirror-bg"])
+        self.stack.add_named(self.build_waiting(), "waiting")
+
+        self.picture = Gtk.Picture(content_fit=Gtk.ContentFit.FILL, can_shrink=True, css_classes=["screen"])
+        self.picture.set_overflow(Gtk.Overflow.HIDDEN)
+        self.frame = Gtk.Box(css_classes=["phone-frame"])
+        self.frame.set_overflow(Gtk.Overflow.HIDDEN)
+        self.frame.append(self.picture)
+        self.picture.set_hexpand(True)
+        self.picture.set_vexpand(True)
+        self.aspect = Gtk.AspectFrame(ratio=0.46, obey_child=False, xalign=0.5, yalign=0.5,
+                                      margin_top=18, margin_bottom=22, margin_start=18, margin_end=18)
+        self.aspect.set_child(self.frame)
+        self.stack.add_named(self.aspect, "live")
+        view.set_content(self.stack)
+        self.toasts.set_child(view)
+        self.set_content(self.toasts)
+
+        self.connect("close-request", self._on_close)
+        GLib.timeout_add_seconds(1, self._tick_fps)
+        self.start_receiver()
+
+    # --- layout
+    def build_waiting(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, valign=Gtk.Align.CENTER,
+                      halign=Gtk.Align.CENTER, margin_start=26, margin_end=26)
+        box.append(Gtk.Image(icon_name="phone-apple-iphone", pixel_size=120, css_classes=["pulse-icon"]))
+        self.wait_title = Gtk.Label(label="Waiting for your iPhone", css_classes=["empty-title"])
+        box.append(self.wait_title)
+        ssid = wifi_name()
+        steps = [
+            f"Connect the iPhone to the same Wi‑Fi{f' — “{ssid}”' if ssid else ''}",
+            "Swipe down from the top-right corner to open Control Center",
+            f"Tap Screen Mirroring and choose “{MIRROR_NAME}”",
+        ]
+        self.steps_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=6)
+        for i, text in enumerate(steps, 1):
+            row = Gtk.Box(spacing=12, css_classes=["step"])
+            row.append(Gtk.Label(label=str(i), css_classes=["step-num"], valign=Gtk.Align.CENTER))
+            row.append(Gtk.Label(label=text, wrap=True, xalign=0, hexpand=True, max_width_chars=34))
+            self.steps_box.append(row)
+        box.append(self.steps_box)
+        self.wait_err = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, css_classes=["dim-label"],
+                                  max_width_chars=44, visible=False, selectable=True)
+        box.append(self.wait_err)
+        return box
+
+    def show_error(self, title, text):
+        self.wait_title.set_label(title)
+        self.wait_err.set_label(text)
+        self.wait_err.set_visible(True)
+        self.steps_box.set_visible(False)
+        self.wtitle.set_subtitle("Not available")
+
+    # --- uxplay receiver
+    def start_receiver(self):
+        if not shutil.which("uxplay"):
+            self.show_error("Screen mirroring isn’t installed",
+                            "Install it once in a terminal:\nsudo apt install uxplay gstreamer1.0-plugins-bad")
+            return
+        rc, out, _ = run(["pgrep", "-x", "uxplay"], timeout=5)
+        if rc == 0:
+            self.show_error("Another mirroring receiver is running",
+                            "Close the other UxPlay window (or run “pkill uxplay”) and open this again.")
+            return
+        sink = f"gdppay ! tcpserversink host=127.0.0.1 port={MIRROR_PORT}"
+
+        def die_with_app():  # Linux: SIGTERM uxplay automatically if this app exits or crashes
+            import ctypes
+            import signal
+            ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+        try:
+            self.proc = subprocess.Popen(
+                # -avdec: decode on the CPU (a VA-API decoder outputs GPU memory, which can't go through
+                #         the socket); -vsync no: don't hold frames for timestamp sync (they never left uxplay)
+                ["uxplay", "-n", MIRROR_NAME, "-nh", "-p", "-reset", "0", "-avdec", "-vsync", "no", "-vs", sink],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, preexec_fn=die_with_app)
+        except OSError as e:
+            self.show_error("Could not start mirroring", str(e))
+            return
+        self.wtitle.set_subtitle(f"Ready · choose “{MIRROR_NAME}” on your iPhone")
+        threading.Thread(target=self._watch_receiver, daemon=True).start()
+        GLib.timeout_add(1200, self._connect_client)
+
+    def _watch_receiver(self):
+        tail = []
+        os.makedirs(os.path.dirname(MIRROR_LOG), exist_ok=True)
+        with open(MIRROR_LOG, "w", encoding="utf-8") as log:  # kept for troubleshooting
+            for raw in iter(self.proc.stdout.readline, b""):
+                line = raw.decode(errors="replace").strip()
+                if line:
+                    log.write(time.strftime("%H:%M:%S ") + line + "\n")
+                    log.flush()
+                    tail = (tail + [line])[-8:]
+        rc = self.proc.wait()
+        if not self.closing:
+            GLib.idle_add(self.show_error, "Mirroring stopped",
+                          f"The receiver exited (code {rc}).\n" + "\n".join(tail[-4:]))
+
+    # --- frame client
+    def _connect_client(self):
+        if self.closing or not self.proc or self.proc.poll() is not None:
+            return False
+        Gst = self.Gst
+        self.client = Gst.parse_launch(
+            f"tcpclientsrc host=127.0.0.1 port={MIRROR_PORT} ! gdpdepay ! videoconvert "
+            "! video/x-raw,format=RGBA ! appsink name=out emit-signals=true max-buffers=1 drop=true sync=false")
+        self.client.get_by_name("out").connect("new-sample", self._on_sample)
+        bus = self.client.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self._on_client_end)
+        bus.connect("message::eos", self._on_client_end)
+        self.client.set_state(Gst.State.PLAYING)
+        return False
+
+    def _on_client_end(self, _bus, _msg):
+        # the receiver isn't streaming yet, or mirroring stopped: go back to waiting and retry
+        if self.client:
+            self.client.set_state(self.Gst.State.NULL)
+            self.client = None
+        if not self.closing:
+            self._set_live(False)
+            GLib.timeout_add(1000, self._connect_client)
+
+    def _on_sample(self, sink):
+        smp = sink.emit("pull-sample")
+        st = smp.get_caps().get_structure(0)
+        w, h = st.get_value("width"), st.get_value("height")
+        buf = smp.get_buffer()
+        ok, info = buf.map(self.Gst.MapFlags.READ)
+        if ok:
+            data = bytes(info.data)
+            buf.unmap(info)
+            with self.lock:
+                self.pending = (w, h, data)
+                if not self.idle_queued:
+                    self.idle_queued = True
+                    GLib.idle_add(self._paint)
+        return self.Gst.FlowReturn.OK
+
+    def _paint(self):
+        with self.lock:
+            frame, self.pending, self.idle_queued = self.pending, None, False
+        if not frame or self.closing:
+            return False
+        w, h, data = frame
+        stride = len(data) // h if h else w * 4
+        self.texture = Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.R8G8B8A8, GLib.Bytes.new(data), stride)
+        self.picture.set_paintable(self.texture)
+        self.frames += 1
+        if (w, h) != self.size:
+            self.size = (w, h)
+            self.aspect.set_ratio(w / h)
+            (self.frame.add_css_class if w > h else self.frame.remove_css_class)("landscape")
+        self._set_live(True)
+        return False
+
+    def _set_live(self, live):
+        if live and self.stack.get_visible_child_name() != "live":
+            self.stack.set_visible_child_name("live")
+            self.wtitle.set_subtitle("Your iPhone screen, live")
+        elif not live and self.stack.get_visible_child_name() != "waiting":
+            self.stack.set_visible_child_name("waiting")
+            self.wtitle.set_subtitle(f"Ready · choose “{MIRROR_NAME}” on your iPhone")
+        self.live.set_visible(live)
+        self.shot_btn.set_sensitive(live)
+        if not live:
+            self.fps_lbl.set_label("")
+
+    def _tick_fps(self):
+        if self.closing:
+            return False
+        if self.live.get_visible():
+            self.fps_lbl.set_label(f"{self.frames} fps")
+        self.frames = 0
+        return True
+
+    # --- actions
+    def screenshot(self, *_):
+        if not self.texture:
+            return
+        os.makedirs(SHOTS_DIR, exist_ok=True)
+        path = os.path.join(SHOTS_DIR, time.strftime("iPhone %Y-%m-%d at %H.%M.%S.png"))
+        self.texture.save_to_png(path)
+        t = Adw.Toast(title="Screenshot saved", button_label="Open", timeout=5)
+        t.connect("button-clicked", lambda *_: Gio.AppInfo.launch_default_for_uri(
+            Gio.File.new_for_path(path).get_uri(), None))
+        self.toasts.add_toast(t)
+
+    def toggle_fullscreen(self, *_):
+        if self.is_fullscreen():
+            self.unfullscreen()
+            self.fs_btn.set_icon_name("view-fullscreen-symbolic")
+        else:
+            self.fullscreen()
+            self.fs_btn.set_icon_name("view-restore-symbolic")
+
+    def _on_close(self, *_):
+        self.closing = True
+        if self.client:
+            self.client.set_state(self.Gst.State.NULL)
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        return False
+
+
 # ---------------------------------------------------------------- window
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
@@ -771,6 +1072,9 @@ class Window(Adw.ApplicationWindow):
         self.refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh")
         self.refresh_btn.connect("clicked", lambda *_: self.refresh())
         header.pack_end(self.refresh_btn)
+        mirror_btn = Gtk.Button(icon_name="video-display-symbolic", tooltip_text="Mirror the iPhone screen")
+        mirror_btn.connect("clicked", self.open_mirror)
+        header.pack_end(mirror_btn)
         self.spinner = Gtk.Spinner()
         header.pack_start(self.spinner)
         view.add_top_bar(header)
@@ -864,6 +1168,13 @@ class Window(Adw.ApplicationWindow):
         txt.append(self.name_lbl)
         txt.append(chips)
         txt.append(status)
+        mirror = Gtk.Button(css_classes=["flat", "mirror-pill"], halign=Gtk.Align.START, margin_top=4)
+        mb = Gtk.Box(spacing=7)
+        mb.append(Gtk.Image(icon_name="video-display-symbolic"))
+        mb.append(Gtk.Label(label="Mirror screen"))
+        mirror.set_child(mb)
+        mirror.connect("clicked", self.open_mirror)
+        txt.append(mirror)
         hero.append(txt)
 
         # gauges
@@ -1094,6 +1405,8 @@ class Window(Adw.ApplicationWindow):
             stagger_reveal(self.sections)
             if os.environ.get("IPHONE_TOOLS_OPEN") == "music" and not getattr(self, "music_win", None):
                 GLib.timeout_add(600, lambda: (self.open_music(), False)[1])  # developer aid
+            if os.environ.get("IPHONE_TOOLS_OPEN") == "mirror" and not getattr(self, "mirror_win", None):
+                GLib.timeout_add(600, lambda: (self.open_mirror(), False)[1])  # developer aid
         return False
 
     # ---------- actions ----------
@@ -1131,6 +1444,14 @@ class Window(Adw.ApplicationWindow):
         except GLib.Error as e:
             self.toast(f"Could not open {what}: unlock the iPhone and try again ({e.message})")
         return False
+
+    def open_mirror(self, *_):
+        win = getattr(self, "mirror_win", None)
+        if win and win.get_visible():
+            win.present()
+            return
+        self.mirror_win = MirrorWindow(self)  # works over Wi-Fi, no USB needed
+        self.mirror_win.present()
 
     def open_music(self, *_):
         if not self.need_device():
@@ -1301,15 +1622,24 @@ class App(Adw.Application):
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
+    def do_shutdown(self):
+        for w in self.get_windows():  # quitting the app also stops the mirroring receiver
+            mw = getattr(w, "mirror_win", None)
+            if mw:
+                mw._on_close()
+        Adw.Application.do_shutdown(self)
+
     def do_activate(self):
         win = self.props.active_window or Window(self)
         win.present()
+        if os.environ.get("IPHONE_TOOLS_OPEN") == "mirror":  # developer aid
+            GLib.timeout_add(800, lambda: (win.open_mirror(), False)[1])
         shot = os.environ.get("IPHONE_TOOLS_SHOT")  # developer aid: save a PNG of the window
         if shot:
             GLib.timeout_add(int(os.environ.get("IPHONE_TOOLS_SHOT_MS", "4500")), self._shot, win, shot)
 
     def _shot(self, win, path):
-        win = getattr(win, "music_win", None) or win
+        win = getattr(win, "music_win", None) or getattr(win, "mirror_win", None) or win
         w, h = win.get_width(), win.get_height()
         paintable = Gtk.WidgetPaintable(widget=win)
         snap = Gtk.Snapshot()
