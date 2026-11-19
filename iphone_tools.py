@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """iPhone Tools - a 3uTools-style GTK4/libadwaita front-end for libimobiledevice."""
 
+import glob
 import math
 import os
 import plistlib
@@ -174,6 +175,32 @@ def run(args, timeout=20):
         return p.returncode, p.stdout, p.stderr.decode(errors="replace")
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         return 1, b"", str(e)
+
+
+def iphone_on_usb():
+    """True if an Apple iPhone/iPad is physically plugged in (read from sysfs, no usbmuxd needed)."""
+    for vendor in glob.glob("/sys/bus/usb/devices/*/idVendor"):
+        try:
+            if open(vendor).read().strip() != "05ac":
+                continue
+            product = open(os.path.join(os.path.dirname(vendor), "product")).read()
+            if "iPhone" in product or "iPad" in product:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def find_device():
+    """-> (udid or None, problem) where problem is None, "service" (usbmuxd not answering)
+    or "pairing" (phone plugged in but not listed: locked, not trusted, or lockdown error)."""
+    rc, out, _ = run(["idevice_id", "-l"], timeout=5)
+    ids = out.decode().split() if rc == 0 else []
+    if ids:
+        return ids[0], None
+    if not iphone_on_usb():
+        return None, None
+    return None, ("service" if rc != 0 else "pairing")
 
 
 def parse_info(raw):
@@ -776,7 +803,36 @@ class Window(Adw.ApplicationWindow):
         wait.append(sp)
         wait.append(Gtk.Label(label="Waiting for device", css_classes=["dim-label"]))
         box.append(wait)
+        self.repair_btn = Gtk.Button(label="Repair connection", halign=Gtk.Align.CENTER, margin_top=6,
+                                     css_classes=["pill", "suggested-action"])
+        self.repair_btn.connect("clicked", self.repair)
+        self.repair_rev = revealer(self.repair_btn)
+        box.append(self.repair_rev)
         return box
+
+    def repair(self, *_):
+        """Restart usbmuxd (Linux's iPhone connection service) via the graphical password prompt."""
+        self.repair_btn.set_sensitive(False)
+        self.repair_btn.set_label("Repairing…")
+
+        def worker():
+            rc, _, err = run(["pkexec", "systemctl", "restart", "usbmuxd"], timeout=180)
+            time.sleep(3)  # let the phone reconnect
+            GLib.idle_add(self._repaired, rc, err)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _repaired(self, rc, err):
+        self.repair_btn.set_sensitive(True)
+        self.repair_btn.set_label("Repair connection")
+        if rc == 0:
+            self.toast("Connection service restarted ✔")
+        elif rc in (126, 127):
+            self.toast("Repair cancelled")
+        else:
+            self.toast(f"Repair failed: {err.strip()[:80] or rc}")
+        self.conn = None
+        self.refresh()
+        return False
 
     def card(self, title=None, extra_css=()):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["card", *extra_css])
@@ -926,9 +982,8 @@ class Window(Adw.ApplicationWindow):
         return True
 
     def _poll_worker(self):
-        rc, out, _ = run(["idevice_id", "-l"], timeout=5)
-        ids = out.decode().split() if rc == 0 else []
-        if (ids[0] if ids else None) != self.udid:
+        state = find_device()
+        if state != getattr(self, "conn", None):
             GLib.idle_add(self.refresh)
 
     def refresh(self, *_):
@@ -940,26 +995,33 @@ class Window(Adw.ApplicationWindow):
         return False
 
     def _refresh_worker(self):
-        rc, out, _ = run(["idevice_id", "-l"], timeout=5)
-        ids = out.decode().split() if rc == 0 else []
-        data = read_device(ids[0]) if ids else None
-        GLib.idle_add(self._show, ids[0] if ids else None, data)
+        udid, problem = find_device()
+        data = read_device(udid) if udid else None
+        GLib.idle_add(self._show, udid, data, problem)
 
-    def _show(self, udid, data):
+    def _show(self, udid, data, problem=None):
         self.busy = False
         self.spinner.stop()
+        self.conn = (udid, problem)
         was_shown = self.stack.get_visible_child_name() == "device" and self.udid == udid
         self.udid, self.data = udid, data
         if not data or "error" in data:
-            if data:
+            if problem == "service":
+                self.empty_title.set_label("Connection problem")
+                self.empty_desc.set_label("Your iPhone is plugged in, but Linux’s iPhone service stopped "
+                                          "responding. Click Repair — you’ll be asked for your password.")
+            elif data or problem == "pairing":
                 self.empty_title.set_label("Unlock your iPhone")
-                self.empty_desc.set_label("Unlock the phone and tap “Trust”. It will appear here automatically.")
+                self.empty_desc.set_label("Unlock the phone and tap “Trust”. It will appear here automatically. "
+                                          "Still nothing after a few seconds? Click Repair.")
             else:
                 self.empty_title.set_label("Connect your iPhone")
                 self.empty_desc.set_label("Plug it in with a cable, unlock it and tap “Trust” on the phone.")
-            self.wtitle.set_subtitle("No iPhone connected")
+            self.repair_rev.set_reveal_child(problem is not None)
+            self.wtitle.set_subtitle("Connection problem" if problem == "service" else "No iPhone connected")
             self.stack.set_visible_child_name("empty")
             return False
+        self.repair_rev.set_reveal_child(False)
 
         i, b, dk, s = data["info"], data["battery"], data["disk"], data["smart"]
         ptype = i.get("ProductType", "")

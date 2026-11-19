@@ -14,6 +14,7 @@ A small **3uTools-style iPhone manager for Linux**, built with GTK4 + libadwaita
 - **Add music** – drag & drop songs or a folder (MP3, M4A, AAC, WAV, FLAC…) and send them to a music app on the iPhone (Spotify *Local Files*, VLC, …), see and remove the songs already there
 - **Quick actions** – open photos and app files, full **backup** with progress, rename the iPhone, copy all info, restart or shut down the phone
 - **Animations** – animated ring gauges and counters, growing storage bar, slide-in sections, hover effects
+- **Connection repair** – detects when the iPhone is plugged in but Linux's iPhone service (usbmuxd) stopped responding, and fixes it with one click (asks for your password)
 
 ## Requirements
 
