@@ -175,6 +175,21 @@ def rgba(colour, alpha=1.0):
     return c
 
 
+# Icons that only some themes have (e.g. WhiteSur) get fallbacks; "iphone-tools" ships with the app.
+ICON_FALLBACKS = {
+    "phone-apple-iphone": ["phone-apple-iphone", "iphone-tools", "phone"],
+    "org.gnome.Music": ["org.gnome.Music", "multimedia-audio-player", "audio-x-generic"],
+    "deja-dup": ["deja-dup", "org.gnome.DejaDup", "document-save"],
+    "spotify": ["spotify", "spotify-client", "org.gnome.Music", "audio-x-generic"],
+    "vlc": ["vlc", "org.videolan.VLC", "multimedia-video-player", "audio-x-generic"],
+}
+
+
+def themed(name):
+    """A GIcon that tries `name` first, then sensible fallbacks, so the app looks right on any icon theme."""
+    return Gio.ThemedIcon.new_from_names(ICON_FALLBACKS.get(name, [name]))
+
+
 def pt(x, y):
     return Graphene.Point().init(x, y)
 
@@ -472,7 +487,7 @@ class MusicWindow(Adw.Window):
         # target app
         tgt = Adw.PreferencesGroup(title="Send songs to")
         self.combo = Adw.ComboRow(title="Music app", model=Gtk.StringList.new(["Loading apps…"]), sensitive=False)
-        self.app_icon = Gtk.Image(icon_name="org.gnome.Music", pixel_size=32)
+        self.app_icon = Gtk.Image(gicon=themed("org.gnome.Music"), pixel_size=32)
         self.combo.add_prefix(self.app_icon)
         self.combo.connect("notify::selected", lambda *_: self._target_changed())
         tgt.add(self.combo)
@@ -484,7 +499,7 @@ class MusicWindow(Adw.Window):
         # drop zone
         dz = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, css_classes=["dropzone"])
         self.dz = dz
-        self.dz_icon = Gtk.Image(icon_name="org.gnome.Music", pixel_size=72, css_classes=["float-icon"])
+        self.dz_icon = Gtk.Image(gicon=themed("org.gnome.Music"), pixel_size=72, css_classes=["float-icon"])
         dz.append(self.dz_icon)
         dz.append(Gtk.Label(label="Drop songs or a folder here", css_classes=["big"]))
         dz.append(Gtk.Label(label="MP3 · M4A · AAC · WAV · FLAC …", css_classes=["caption", "dim-label"]))
@@ -581,8 +596,7 @@ class MusicWindow(Adw.Window):
         icon, hint = KNOWN_MUSIC_APPS.get(
             aid, ("org.gnome.Music", "Songs go to this app’s folder (Files → On My iPhone). "
                                      "The app must be able to play files from there."))
-        theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
-        self.app_icon.set_from_icon_name(icon if theme.has_icon(icon) else "org.gnome.Music")
+        self.app_icon.set_from_gicon(themed(icon))
         self.hint_rev.set_reveal_child(False)
         self.hint.set_label("💡 " + hint)
         GLib.timeout_add(180, lambda: (self.hint_rev.set_reveal_child(True), False)[1])
@@ -870,7 +884,7 @@ class MirrorWindow(Adw.Window):
     def build_waiting(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, valign=Gtk.Align.CENTER,
                       halign=Gtk.Align.CENTER, margin_start=26, margin_end=26)
-        box.append(Gtk.Image(icon_name="phone-apple-iphone", pixel_size=120, css_classes=["pulse-icon"]))
+        box.append(Gtk.Image(gicon=themed("phone-apple-iphone"), pixel_size=120, css_classes=["pulse-icon"]))
         self.wait_title = Gtk.Label(label="Waiting for your iPhone", css_classes=["empty-title"])
         box.append(self.wait_title)
         ssid = wifi_name()
@@ -1095,7 +1109,7 @@ class Window(Adw.ApplicationWindow):
     def build_empty(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, valign=Gtk.Align.CENTER,
                       halign=Gtk.Align.CENTER, margin_start=30, margin_end=30)
-        box.append(Gtk.Image(icon_name="phone-apple-iphone", pixel_size=150, css_classes=["pulse-icon"]))
+        box.append(Gtk.Image(gicon=themed("phone-apple-iphone"), pixel_size=150, css_classes=["pulse-icon"]))
         self.empty_title = Gtk.Label(label="Connect your iPhone", css_classes=["empty-title"])
         self.empty_desc = Gtk.Label(label="Plug it in with a cable, unlock it and tap “Trust” on the phone.",
                                     wrap=True, justify=Gtk.Justification.CENTER, css_classes=["dim-label"],
@@ -1152,7 +1166,7 @@ class Window(Adw.ApplicationWindow):
 
         # hero
         hero = Gtk.Box(spacing=20, css_classes=["hero"])
-        hero.append(Gtk.Image(icon_name="phone-apple-iphone", pixel_size=104, css_classes=["float-icon"]))
+        hero.append(Gtk.Image(gicon=themed("phone-apple-iphone"), pixel_size=104, css_classes=["float-icon"]))
         txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, valign=Gtk.Align.CENTER, hexpand=True)
         self.name_lbl = Gtk.Label(xalign=0, css_classes=["name"], ellipsize=Pango.EllipsizeMode.END)
         chips = Gtk.Box(spacing=6)
@@ -1219,7 +1233,7 @@ class Window(Adw.ApplicationWindow):
         # backup progress (hidden until a backup runs)
         bcard = self.card(extra_css=("backup-card",))
         top = Gtk.Box(spacing=10)
-        top.append(Gtk.Image(icon_name="deja-dup", pixel_size=32))
+        top.append(Gtk.Image(gicon=themed("deja-dup"), pixel_size=32))
         bt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
         self.bk_title = Gtk.Label(label="Backing up…", xalign=0, css_classes=["section-title"])
         self.bk_line = Gtk.Label(xalign=0, css_classes=["caption", "dim-label"], ellipsize=Pango.EllipsizeMode.END)
@@ -1253,7 +1267,7 @@ class Window(Adw.ApplicationWindow):
         ]:
             btn = Gtk.Button(css_classes=["flat", "tile"] + (["danger"] if danger else []))
             b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-            b.append(Gtk.Image(icon_name=icon, pixel_size=40))
+            b.append(Gtk.Image(gicon=themed(icon), pixel_size=40))
             lbl = Gtk.Label(label=title, css_classes=["caption-heading"])
             b.append(lbl)
             btn.set_child(b)
@@ -1533,16 +1547,22 @@ class Window(Adw.ApplicationWindow):
             used = int(dk.get("TotalDataCapacity", 0)) - int(dk.get("TotalDataAvailable", 0))
         except ValueError:
             used = 0
-        body = (f"A full backup of about {gb(used)} will be saved to “{BACKUP_DIR}”. "
-                f"You have {gb(free)} free on this PC.\n\nKeep the iPhone plugged in and unlocked until it finishes.")
+        body = (f"A backup of about {gb(used)} will be saved to “{BACKUP_DIR}” (after the first one, only "
+                f"changes are copied). You have {gb(free)} free on this PC.\n\n"
+                "Keep the iPhone plugged in and unlocked until it finishes. If it asks for your passcode, enter it.")
         self.confirm("Back up iPhone?", body, "Start backup", self._start_backup)
 
     def _start_backup(self):
         os.makedirs(BACKUP_DIR, exist_ok=True)
+        # pymobiledevice3 works on iOS 17+ and is incremental after the first backup;
+        # libimobiledevice 1.3's idevicebackup2 hangs at "Requesting backup" on iOS 26.
+        pmd3 = shutil.which("pymobiledevice3") or os.path.expanduser("~/.local/bin/pymobiledevice3")
+        if os.path.exists(pmd3):
+            cmd = [pmd3, "backup2", "backup", BACKUP_DIR]
+        else:
+            cmd = ["idevicebackup2", "-u", self.udid, "backup", "--full", BACKUP_DIR]
         try:
-            self.backup_proc = subprocess.Popen(
-                ["idevicebackup2", "-u", self.udid, "backup", "--full", BACKUP_DIR],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+            self.backup_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
         except OSError as e:
             self.toast(f"Backup could not start: {e}")
             return
