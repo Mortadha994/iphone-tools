@@ -177,7 +177,7 @@ def rgba(colour, alpha=1.0):
 
 # Icons that only some themes have (e.g. WhiteSur) get fallbacks; "iphone-tools" ships with the app.
 ICON_FALLBACKS = {
-    "phone-apple-iphone": ["phone-apple-iphone", "iphone-tools", "phone"],
+    "phone-apple-iphone": ["phone-apple-iphone", "iphone-tools"],
     "org.gnome.Music": ["org.gnome.Music", "multimedia-audio-player", "audio-x-generic"],
     "deja-dup": ["deja-dup", "org.gnome.DejaDup", "document-save"],
     "spotify": ["spotify", "spotify-client", "org.gnome.Music", "audio-x-generic"],
@@ -187,7 +187,17 @@ ICON_FALLBACKS = {
 
 def themed(name):
     """A GIcon that tries `name` first, then sensible fallbacks, so the app looks right on any icon theme."""
-    return Gio.ThemedIcon.new_from_names(ICON_FALLBACKS.get(name, [name]))
+    names = ICON_FALLBACKS.get(name, [name])
+    if name == "phone-apple-iphone":
+        # GTK searches the whole system theme for *every* fallback name before hicolor, so a generic
+        # "phone" would beat our own icon. Pick explicitly: theme's iPhone > our installed icon > the
+        # SVG next to this file (running from a fresh clone without ./install.sh).
+        theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+        if not theme.has_icon("phone-apple-iphone") and not theme.has_icon("iphone-tools"):
+            local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "iphone-tools.svg")
+            if os.path.exists(local):
+                return Gio.FileIcon.new(Gio.File.new_for_path(local))
+    return Gio.ThemedIcon.new_from_names(names)
 
 
 def pt(x, y):
