@@ -147,6 +147,10 @@ CSS = f"""
   transition: background 180ms ease;
 }}
 .mirror-pill:hover {{ background: alpha(white, 0.34); }}
+/* some themes (e.g. WhiteSur) restyle flat buttons: be more specific so the pill looks the same everywhere */
+button.flat.mirror-pill {{ background: alpha(white, 0.22); border-radius: 99px; padding: 6px 14px; }}
+button.flat.mirror-pill:hover {{ background: alpha(white, 0.34); }}
+.mirror-pill label, .mirror-pill image {{ color: white; opacity: 1; }}
 """
 
 # Apps that read songs from their "iTunes File Sharing" folder, with how to see them on the phone.
@@ -1663,7 +1667,7 @@ class App(Adw.Application):
         css = Gtk.CssProvider()
         css.load_from_string(CSS)
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
-                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)  # our own classes win over theme gtk.css
 
     def do_shutdown(self):
         for w in self.get_windows():  # quitting the app also stops the mirroring receiver
