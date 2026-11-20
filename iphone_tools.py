@@ -158,12 +158,13 @@ button.flat.mirror-pill:hover {{ background: alpha(white, 0.34); }}
 .log-view {{ font-size: 0.85em; }}
 """
 
-# Tool windows: (tile title, icon, module in itools/, window class taking (parent, udid))
+# Tool windows: (tile title, icon, module in itools/, window class taking (parent, udid), needs the iPhone)
 TOOLS = [
-    ("Import photos", "folder-pictures", "photos", "PhotoImportWindow"),
-    ("Apps", "application-x-executable", "apps", "AppsWindow"),
-    ("Battery history", "battery-full-charged", "battery", "BatteryHistoryWindow"),
-    ("Crash reports", "utilities-system-monitor", "logs", "LogsWindow"),
+    ("Import photos", "folder-pictures", "photos", "PhotoImportWindow", True),
+    ("Apps", "application-x-executable", "apps", "AppsWindow", True),
+    ("Battery history", "battery-full-charged", "battery", "BatteryHistoryWindow", True),
+    ("Crash reports", "utilities-system-monitor", "logs", "LogsWindow", True),
+    ("Backup browser", "drive-harddisk", "backups", "BackupsWindow", False),
 ]
 
 # Apps that read songs from their "iTunes File Sharing" folder, with how to see them on the phone.
@@ -1267,6 +1268,9 @@ class Window(Adw.ApplicationWindow):
 
         self.refresh()
         GLib.timeout_add_seconds(3, self.poll)
+        dev = os.environ.get("IPHONE_TOOLS_OPEN", "")
+        if dev.startswith("tool:backups:"):  # developer aid: no iPhone needed
+            GLib.timeout_add(600, lambda: (self.open_tool("backups", "BackupsWindow"), False)[1])
 
     # ---------- layout ----------
     def build_empty(self):
@@ -1289,6 +1293,9 @@ class Window(Adw.ApplicationWindow):
         self.repair_btn.connect("clicked", self.repair)
         self.repair_rev = revealer(self.repair_btn)
         box.append(self.repair_rev)
+        browse = Gtk.Button(label="Browse backups", halign=Gtk.Align.CENTER, margin_top=18, css_classes=["pill"])
+        browse.connect("clicked", lambda *_: self.open_tool("backups", "BackupsWindow"))
+        box.append(browse)
         return box
 
     def repair(self, *_):
@@ -1452,7 +1459,7 @@ class Window(Adw.ApplicationWindow):
         tcard = self.card("Tools")
         tflow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
                             min_children_per_line=3, max_children_per_line=3, column_spacing=10, row_spacing=10)
-        for title, icon, module, cls in TOOLS:
+        for title, icon, module, cls, _needs in TOOLS:
             btn = Gtk.Button(css_classes=["flat", "tile"])
             b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
             b.append(Gtk.Image(gicon=themed(icon), pixel_size=40))
@@ -1675,7 +1682,8 @@ class Window(Adw.ApplicationWindow):
 
     def open_tool(self, module, cls):
         """Open a tool window from itools/<module>.py (one window per tool, re-presented if already open)."""
-        if not self.need_device():
+        needs = next((t[4] for t in TOOLS if t[3] == cls), True)
+        if needs and not self.need_device():
             return
         win = self.tool_wins.get(cls)
         if win and win.get_visible() and getattr(win, "udid", None) == self.udid:
