@@ -224,3 +224,55 @@ def pmd3():
     """Path of the pymobiledevice3 command, or None if it isn't installed."""
     p = shutil.which("pymobiledevice3") or os.path.expanduser("~/.local/bin/pymobiledevice3")
     return p if os.path.exists(p) else None
+
+
+def pmd3_python():
+    """The Python interpreter of pymobiledevice3's own (pipx) environment, or None."""
+    tool = pmd3()
+    if not tool:
+        return None
+    real = os.path.realpath(tool)
+    try:  # pipx/pip entry points start with "#!/path/to/venv/bin/python"
+        with open(real, "rb") as f:
+            first = f.readline().decode(errors="replace")
+        if first.startswith("#!") and "python" in first:
+            py = first[2:].strip().split()[0]
+            if os.path.exists(py):
+                return py
+    except OSError:
+        pass
+    py = os.path.join(os.path.dirname(real), "python")
+    return py if os.path.exists(py) else None
+
+
+NEEDS_PMD3 = "Needs pymobiledevice3: sudo apt install -y pipx && pipx install pymobiledevice3"
+
+
+def helper(udid, *args, on_line=None, proc_holder=None):
+    """Run itools/pmd3_helper.py with pymobiledevice3's Python. Returns the list of JSON objects it printed
+    (or calls on_line(obj) for each as it arrives). Raises RuntimeError with a readable message on failure."""
+    import json
+    py = pmd3_python()
+    if not py:
+        raise RuntimeError(NEEDS_PMD3)
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pmd3_helper.py")
+    p = subprocess.Popen([py, "-I", script, udid, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc_holder is not None:
+        proc_holder.append(p)
+    out, err = [], None
+    for line in p.stdout:
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if "error" in obj and len(obj) == 1:
+            err = obj["error"]
+            continue
+        if on_line:
+            on_line(obj)
+        else:
+            out.append(obj)
+    stderr = p.stderr.read()
+    if p.wait() != 0 or err:
+        raise RuntimeError(err or (stderr.strip().splitlines() or ["The iPhone didn’t answer"])[-1])
+    return out

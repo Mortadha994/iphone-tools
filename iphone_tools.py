@@ -152,6 +152,7 @@ button.flat.mirror-pill:hover {{ background: alpha(white, 0.34); }}
 # Tool windows: (tile title, icon, module in itools/, window class taking (parent, udid))
 TOOLS = [
     ("Import photos", "folder-pictures", "photos", "PhotoImportWindow"),
+    ("Apps", "application-x-executable", "apps", "AppsWindow"),
 ]
 
 # Apps that read songs from their "iTunes File Sharing" folder, with how to see them on the phone.
