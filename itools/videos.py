@@ -28,16 +28,25 @@ VIDEO_APPS = {
 }
 
 
+_init_lock = threading.Lock()
+
+
 def init_gst():
-    if not Gst.is_initialized():
-        Gst.init(None)
+    # Two threads running Gst.init() at once leave the plugin list half-loaded ("couldn't create uridecodebin")
+    with _init_lock:
+        if not Gst.is_initialized():
+            Gst.init(None)
+
+
+_probe_lock = threading.Lock()
 
 
 def plays_on_iphone(path):
-    """True if the file is already MP4/MOV with H.264/HEVC video and AAC (or no) audio, so no conversion needed."""
+    """-> (True if the file is already MP4/MOV with H.264/HEVC video and AAC (or no) audio, duration in s)."""
     init_gst()
     try:
-        info = GstPbutils.Discoverer.new(15 * Gst.SECOND).discover_uri(Gst.filename_to_uri(path))
+        with _probe_lock:  # two Discoverers running at once can fail, so check one file at a time
+            info = GstPbutils.Discoverer.new(15 * Gst.SECOND).discover_uri(Gst.filename_to_uri(path))
     except GLib.Error:
         return False, 0
     dur = info.get_duration() / Gst.SECOND if info.get_duration() else 0
@@ -154,15 +163,17 @@ class VideosWindow(Adw.Window):
         self.udid = udid
         self.apps, self.items, self.busy, self.cancel = [], [], False, False
         self.lock = threading.Lock()
+        init_gst()
         col = window_shell(self, "Videos to iPhone", "Converted to play on the iPhone", width=580, height=780)
 
         tgt = Adw.PreferencesGroup(title="Send videos to")
         self.combo = Adw.ComboRow(title="Video app", model=Gtk.StringList.new(["Loading apps…"]), sensitive=False)
-        self.combo.add_prefix(Gtk.Image(gicon=themed("vlc"), pixel_size=32))
+        self.combo.add_prefix(Gtk.Image(gicon=themed("video-x-generic"), pixel_size=32))
         self.combo.connect("notify::selected", lambda *_: self._target_changed())
         tgt.add(self.combo)
         col.append(tgt)
-        self.hint = Gtk.Label(wrap=True, xalign=0, css_classes=["hint-card"])
+        self.hint = Gtk.Label(wrap=True, xalign=0, css_classes=["hint-card"], visible=False)
+        self.hint.connect("notify::label", lambda h, _p: h.set_visible(bool(h.get_label())))
         col.append(self.hint)
 
         dz = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, css_classes=["dropzone"])
@@ -193,6 +204,8 @@ class VideosWindow(Adw.Window):
 
         self.spinner.start()
         in_thread(self._load_apps)
+        if os.environ.get("IPHONE_TOOLS_VIDEO_ADD"):  # developer aid
+            GLib.timeout_add(300, lambda: (self.add(os.environ["IPHONE_TOOLS_VIDEO_ADD"].split(":")), False)[1])
 
     # --- target app
     def _load_apps(self):

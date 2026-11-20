@@ -117,12 +117,17 @@ def revealer(child):
 def share_apps(udid):
     """Apps on the phone that accept files from a computer (iTunes File Sharing): [(bundle_id, name)]."""
     import re
-    rc, out, _ = run(["ifuse", "-u", udid, "--list-apps"], timeout=30)
     apps = []
-    for line in out.decode(errors="replace").splitlines():
-        m = re.match(r'\s*([^,]+),\s*"[^"]*",\s*"(.*)"\s*$', line)
-        if m and m.group(1) != "CFBundleIdentifier":
-            apps.append((m.group(1).strip(), m.group(2)))
+    for attempt in range(4):  # the phone can refuse while the main window is reading it at the same moment
+        rc, out, _ = run(["ifuse", "-u", udid, "--list-apps"], timeout=30)
+        for line in out.decode(errors="replace").splitlines():
+            m = re.match(r'\s*([^,]+),\s*"[^"]*",\s*"(.*)"\s*$', line)
+            if m and m.group(1) != "CFBundleIdentifier":
+                apps.append((m.group(1).strip(), m.group(2)))
+        if rc == 0 and apps:
+            break
+        apps = []
+        time.sleep(1 + attempt)
     return apps
 
 
