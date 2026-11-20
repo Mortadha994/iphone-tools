@@ -21,6 +21,7 @@ gi.require_version("Graphene", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # find itools/ also when run with python3 -I
+from itools import battery as battery_history  # noqa: E402
 from itools.common import (  # noqa: E402
     APP_ID, BACKUP_DIR, BLUE, GREEN, GREY, MODELS, ORANGE, PURPLE, RED, YELLOW,
     gb, pmd3, revealer, rgba, run, stagger_reveal, themed)
@@ -147,12 +148,17 @@ button.flat.mirror-pill:hover {{ background: alpha(white, 0.34); }}
 .status-ok {{ color: {GREEN}; background: alpha({GREEN}, 0.15); }}
 .status-warn {{ color: {ORANGE}; background: alpha({ORANGE}, 0.17); }}
 .hw-note {{ padding: 0 4px; }}
+.stat-value {{ font-size: 1.6em; font-weight: 800; }}
+.stat-green {{ color: {GREEN}; }}
+.stat-orange {{ color: {ORANGE}; }}
+.stat-red {{ color: {RED}; }}
 """
 
 # Tool windows: (tile title, icon, module in itools/, window class taking (parent, udid))
 TOOLS = [
     ("Import photos", "folder-pictures", "photos", "PhotoImportWindow"),
     ("Apps", "application-x-executable", "apps", "AppsWindow"),
+    ("Battery history", "battery-full-charged", "battery", "BatteryHistoryWindow"),
 ]
 
 # Apps that read songs from their "iTunes File Sharing" folder, with how to see them on the phone.
@@ -1524,6 +1530,10 @@ class Window(Adw.ApplicationWindow):
         self.repair_rev.set_reveal_child(False)
 
         i, b, dk, s = data["info"], data["battery"], data["disk"], data["smart"]
+        try:
+            battery_history.record(udid, s)
+        except OSError:
+            pass  # history is a bonus; never block the main view
         ptype = i.get("ProductType", "")
         model = MODELS.get(ptype, ptype or "iPhone")
         self.wtitle.set_subtitle(f"{model} connected")
