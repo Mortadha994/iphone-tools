@@ -152,6 +152,10 @@ button.flat.mirror-pill:hover {{ background: alpha(white, 0.34); }}
 .stat-green {{ color: {GREEN}; }}
 .stat-orange {{ color: {ORANGE}; }}
 .stat-red {{ color: {RED}; }}
+.sev-crash {{ color: {RED}; }}
+.sev-warn {{ color: {ORANGE}; }}
+.sev-info {{ color: {GREY}; }}
+.log-view {{ font-size: 0.85em; }}
 """
 
 # Tool windows: (tile title, icon, module in itools/, window class taking (parent, udid))
@@ -159,6 +163,7 @@ TOOLS = [
     ("Import photos", "folder-pictures", "photos", "PhotoImportWindow"),
     ("Apps", "application-x-executable", "apps", "AppsWindow"),
     ("Battery history", "battery-full-charged", "battery", "BatteryHistoryWindow"),
+    ("Crash reports", "utilities-system-monitor", "logs", "LogsWindow"),
 ]
 
 # Apps that read songs from their "iTunes File Sharing" folder, with how to see them on the phone.
