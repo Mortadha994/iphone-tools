@@ -114,6 +114,42 @@ def revealer(child):
     return r
 
 
+def share_apps(udid):
+    """Apps on the phone that accept files from a computer (iTunes File Sharing): [(bundle_id, name)]."""
+    import re
+    rc, out, _ = run(["ifuse", "-u", udid, "--list-apps"], timeout=30)
+    apps = []
+    for line in out.decode(errors="replace").splitlines():
+        m = re.match(r'\s*([^,]+),\s*"[^"]*",\s*"(.*)"\s*$', line)
+        if m and m.group(1) != "CFBundleIdentifier":
+            apps.append((m.group(1).strip(), m.group(2)))
+    return apps
+
+
+class AppDocs:
+    """`with AppDocs(udid, app_id) as path:` mounts an app's Documents folder via ifuse."""
+
+    def __init__(self, udid, app_id, name="mnt"):
+        self.udid, self.app_id, self.path = udid, app_id, os.path.expanduser(f"~/.cache/iphone-tools/{name}")
+
+    def __enter__(self):
+        os.makedirs(self.path, exist_ok=True)
+        subprocess.run(["fusermount", "-uz", self.path], capture_output=True)  # clear a stale mount
+        rc, _, err = run(["ifuse", "-u", self.udid, "--documents", self.app_id, self.path], timeout=30)
+        if rc != 0:
+            raise RuntimeError(err.strip() or "Could not open the app folder on the iPhone")
+        return self.path
+
+    def __exit__(self, *exc):
+        for _ in range(5):
+            if subprocess.run(["fusermount", "-u", self.path], capture_output=True).returncode == 0:
+                break
+            time.sleep(0.4)
+        else:
+            subprocess.run(["fusermount", "-uz", self.path], capture_output=True)
+        return False
+
+
 class MediaMount:
     """`with MediaMount(udid) as path:` mounts the iPhone's media area (DCIM, …) with ifuse."""
 

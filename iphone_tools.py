@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # find itools/ a
 from itools import battery as battery_history  # noqa: E402
 from itools.common import (  # noqa: E402
     APP_ID, BACKUP_DIR, BLUE, GREEN, GREY, MODELS, ORANGE, PURPLE, RED, YELLOW,
-    gb, pmd3, revealer, rgba, run, stagger_reveal, themed)
+    AppDocs, gb, pmd3, revealer, rgba, run, share_apps, stagger_reveal, themed)
 
 
 CSS = f"""
@@ -164,6 +164,7 @@ TOOLS = [
     ("Apps", "application-x-executable", "apps", "AppsWindow", True),
     ("Battery history", "battery-full-charged", "battery", "BatteryHistoryWindow", True),
     ("Crash reports", "utilities-system-monitor", "logs", "LogsWindow", True),
+    ("Videos to iPhone", "video-x-generic", "videos", "VideosWindow", True),
     ("Backup browser", "drive-harddisk", "backups", "BackupsWindow", False),
     ("Export chats", "mail-send", "export", "ExportWindow", False),
 ]
@@ -176,7 +177,6 @@ KNOWN_MUSIC_APPS = {
     "org.videolan.vlc-ios": ("vlc", "Songs appear in VLC’s Audio tab."),
 }
 AUDIO_EXT = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".aif", ".aiff", ".alac", ".ogg", ".opus", ".mp4"}
-MOUNT_DIR = os.path.expanduser("~/.cache/iphone-tools/mnt")
 MIRROR_NAME = "iPhone Tools"              # name shown in the iPhone's Screen Mirroring list
 MIRROR_PORT = 47800                       # local-only (127.0.0.1) handoff from uxplay to this app
 SHOTS_DIR = os.path.expanduser("~/Pictures/iPhone Screenshots")
@@ -379,40 +379,11 @@ class StorageBar(Gtk.Widget):
 
 # ---------------------------------------------------------------- music (app file sharing)
 def list_share_apps(udid):
-    """Apps on the phone that accept files from a computer: [(bundle_id, name)]."""
-    rc, out, _ = run(["ifuse", "-u", udid, "--list-apps"], timeout=30)
-    apps = []
-    for line in out.decode(errors="replace").splitlines():
-        m = re.match(r'\s*([^,]+),\s*"[^"]*",\s*"(.*)"\s*$', line)
-        if m and m.group(1) != "CFBundleIdentifier":
-            apps.append((m.group(1).strip(), m.group(2)))
+    """Apps on the phone that accept files from a computer: [(bundle_id, name)], music players first."""
+    apps = share_apps(udid)
     # known music players first, Spotify at the top
     apps.sort(key=lambda a: (a[0] not in KNOWN_MUSIC_APPS, a[0] != "com.spotify.client", a[1].lower()))
     return apps
-
-
-class AppDocs:
-    """`with AppDocs(udid, app_id) as path:` mounts an app's Documents folder via ifuse."""
-
-    def __init__(self, udid, app_id):
-        self.udid, self.app_id, self.path = udid, app_id, MOUNT_DIR
-
-    def __enter__(self):
-        os.makedirs(self.path, exist_ok=True)
-        subprocess.run(["fusermount", "-uz", self.path], capture_output=True)  # clear a stale mount
-        rc, _, err = run(["ifuse", "-u", self.udid, "--documents", self.app_id, self.path], timeout=30)
-        if rc != 0:
-            raise RuntimeError(err.strip() or "Could not open the app folder on the iPhone")
-        return self.path
-
-    def __exit__(self, *exc):
-        for _ in range(5):
-            if subprocess.run(["fusermount", "-u", self.path], capture_output=True).returncode == 0:
-                break
-            time.sleep(0.4)
-        else:
-            subprocess.run(["fusermount", "-uz", self.path], capture_output=True)
-        return False
 
 
 def collect_audio(paths):
