@@ -165,6 +165,7 @@ TOOLS = [
     ("Battery history", "battery-full-charged", "battery", "BatteryHistoryWindow", True),
     ("Crash reports", "utilities-system-monitor", "logs", "LogsWindow", True),
     ("Backup browser", "drive-harddisk", "backups", "BackupsWindow", False),
+    ("Export chats", "mail-send", "export", "ExportWindow", False),
 ]
 
 # Apps that read songs from their "iTunes File Sharing" folder, with how to see them on the phone.
@@ -1269,8 +1270,9 @@ class Window(Adw.ApplicationWindow):
         self.refresh()
         GLib.timeout_add_seconds(3, self.poll)
         dev = os.environ.get("IPHONE_TOOLS_OPEN", "")
-        if dev.startswith("tool:backups:"):  # developer aid: no iPhone needed
-            GLib.timeout_add(600, lambda: (self.open_tool("backups", "BackupsWindow"), False)[1])
+        if dev.startswith(("tool:backups:", "tool:export:")):  # developer aid: no iPhone needed
+            _, m, c = dev.split(":")
+            GLib.timeout_add(600, lambda: (self.open_tool(m, c), False)[1])
 
     # ---------- layout ----------
     def build_empty(self):
