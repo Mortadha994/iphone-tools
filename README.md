@@ -14,6 +14,7 @@ and [UxPlay](https://github.com/FDH2/UxPlay).
 
 - **Device overview**: name, model, iOS version and capacity, detected automatically when you plug the phone in
 - **Battery**: charge level, **battery health %** (max vs design capacity in mAh), charge cycles and temperature
+- **Hardware check** (like 3uTools' verification report): the serial number each part reports (battery, screen, cameras, Face ID parts, light sensor) plus logic board serial, ECID, IMEI(s), Wi‑Fi/Bluetooth and modem info. A part with no serial is flagged, which usually means it was replaced. **Copy report** puts it all on the clipboard
 - **Storage**: used / free, calculated like *Settings → General → iPhone Storage*, with an iOS / Photos / Apps breakdown
 - **Add music**: drag & drop songs or a folder (MP3, M4A, AAC, WAV, FLAC…) into a music app on the iPhone (Spotify *Local Files*, VLC, …), and see or remove the songs already there
 - **Screen mirroring**: the iPhone screen **live inside the app** (AirPlay over Wi‑Fi) in an iPhone-shaped frame, with sound, auto-rotation, fullscreen and **screenshots**
@@ -61,6 +62,7 @@ git pull && ./install.sh     # update
 
 - **Screen mirroring**: click **Mirror screen**. On the iPhone, open **Control Center → Screen Mirroring → “iPhone Tools”**. The iPhone and the PC must be on the same Wi‑Fi. If “iPhone Tools” isn't listed yet, wait 5–10 s.
 - **Add music**: songs can't go into the built-in **Apple Music** app from Linux (that needs Apple's private ATC sync service). They go into a music app that accepts files, such as **Spotify**: on the iPhone, open *Spotify → Settings → Local files* and turn on **Show audio files from this device**. They then appear in *Your Library → Local Files*.
+- **Hardware check**: shows what each part reports about itself. 3uTools also compares serials with Apple's factory records, which other apps can't access. For Apple's own verdict, open *Settings → General → About → Parts and Service History* on the iPhone.
 - **Backups** are saved **unencrypted** to `~/iPhone Backups`. Keep them private.
 
 ## Troubleshooting
@@ -76,5 +78,5 @@ git pull && ./install.sh     # update
 ## How it works
 
 One Python file (`iphone_tools.py`) with the GTK4 UI. Device data comes from the `idevice*` command-line tools,
-music and files from `ifuse`, backups from `pymobiledevice3`. Mirroring runs `uxplay` as an AirPlay receiver
+part serial numbers from the IORegistry (`idevicediagnostics ioregentry`), music and files from `ifuse`, backups from `pymobiledevice3`. Mirroring runs `uxplay` as an AirPlay receiver
 that hands decoded frames to the app over a private `127.0.0.1` socket.

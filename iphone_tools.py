@@ -151,6 +151,18 @@ CSS = f"""
 button.flat.mirror-pill {{ background: alpha(white, 0.22); border-radius: 99px; padding: 6px 14px; }}
 button.flat.mirror-pill:hover {{ background: alpha(white, 0.34); }}
 .mirror-pill label, .mirror-pill image {{ color: white; opacity: 1; }}
+.verdict {{ border-radius: 20px; padding: 16px 18px; }}
+.verdict-ok {{ background: alpha({GREEN}, 0.14); border: 1px solid alpha({GREEN}, 0.45); }}
+.verdict-warn {{ background: alpha({ORANGE}, 0.14); border: 1px solid alpha({ORANGE}, 0.50); }}
+.verdict-icon {{
+  border-radius: 99px; min-width: 38px; min-height: 38px; font-size: 1.3em; font-weight: 900; color: white;
+}}
+.verdict-ok .verdict-icon {{ background: {GREEN}; }}
+.verdict-warn .verdict-icon {{ background: {ORANGE}; }}
+.status {{ border-radius: 99px; padding: 2px 10px; font-weight: 700; font-size: 0.82em; }}
+.status-ok {{ color: {GREEN}; background: alpha({GREEN}, 0.15); }}
+.status-warn {{ color: {ORANGE}; background: alpha({ORANGE}, 0.17); }}
+.hw-note {{ padding: 0 4px; }}
 """
 
 # Apps that read songs from their "iTunes File Sharing" folder, with how to see them on the phone.
@@ -835,6 +847,201 @@ class MusicWindow(Adw.Window):
 
 
 # ---------------------------------------------------------------- screen mirroring (AirPlay via uxplay)
+def ioreg_entry(udid, name):
+    """Properties of one IORegistry entry (by name or class), {} if the phone doesn't answer."""
+    rc, out, _ = run(["idevicediagnostics", "-u", udid, "ioregentry", name], timeout=10)
+    try:
+        p = plistlib.loads(out) if rc == 0 and out else {}
+        return p.get("IORegistry", p) or {}
+    except Exception:
+        return {}
+
+
+def part_serial(value):
+    """A serial read from a part: None if the key is absent, "" if the part left it blank (all 0x00/0xFF)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.encode("latin-1", errors="replace")
+    value = value.split(b"\0", 1)[0] if not value.startswith(b"\0") else value.strip(b"\0")
+    if not value.strip(b"\xff\x00 ") or not all(32 <= c < 127 for c in value):
+        return ""
+    return value.decode()
+
+
+def read_hardware(udid, info, smart):
+    """3uTools-style hardware report. -> list of (group, [(title, value, kind)]).
+    kind: "info" (plain value), "ok" (part reports its serial), "missing" (part reports no serial),
+    "pass"/"fail" (self-test). Parts this model doesn't have are left out."""
+    product = ioreg_entry(udid, "product")
+    cams = ioreg_entry(udid, "AppleH10CamIn")
+    prox = ioreg_entry(udid, "AppleProxHIDEventDriver")
+    pearl = ioreg_entry(udid, "ApplePearlSEPDriver")
+    groups = []
+
+    def info_rows(pairs):
+        return [(t, v, "info") for t, v in pairs if v]
+
+    ecid = info.get("UniqueChipID", "")
+    phone = [("Serial number", info.get("SerialNumber")),
+             ("Model", " ".join(x for x in (info.get("ModelNumber"), info.get("RegionInfo")) if x)),
+             ("Logic board serial", info.get("MLBSerialNumber")),
+             ("ECID", f"{int(ecid):X}" if ecid.isdigit() else ecid),
+             ("IMEI", info.get("InternationalMobileEquipmentIdentity")),
+             ("IMEI 2", info.get("InternationalMobileEquipmentIdentity2")),
+             ("Wi-Fi board serial", info.get("WirelessBoardSerialNumber")),
+             ("Wi-Fi address", info.get("WiFiAddress")),
+             ("Bluetooth address", info.get("BluetoothAddress")),
+             ("Modem firmware", info.get("BasebandVersion")),
+             ("Bootloader", info.get("FirmwareVersion"))]
+    groups.append(("Phone", info_rows(phone)))
+
+    def part(title, raw):
+        s = part_serial(raw)
+        return None if s is None else (title, s or "—", "ok" if s else "missing")
+
+    bd = smart.get("BatteryData") or {}
+    battery = [part("Battery", smart.get("Serial") or bd.get("Serial"))]
+    dc, mc = smart.get("DesignCapacity"), smart.get("AppleRawMaxCapacity") or smart.get("NominalChargeCapacity")
+    if dc and mc:
+        battery.append(("Health", f"{min(mc / dc * 100, 100):.0f}% · {mc} of {dc} mAh", "info"))
+    if smart.get("CycleCount") is not None:
+        battery.append(("Charge cycles", str(smart["CycleCount"]), "info"))
+    groups.append(("Battery", [r for r in battery if r]))
+
+    # The display's serial lives in its EEPROM; iOS copies it to the device tree at boot.
+    panel = product.get("raw-panel-serial-number")
+    groups.append(("Screen", [r for r in [part("Screen", panel)] if r]))
+
+    groups.append(("Cameras", [r for r in [
+        part("Rear camera", cams.get("BackCameraModuleSerialNumString")),
+        part("Rear ultra-wide camera", cams.get("BackSuperWideCameraModuleSerialNumString")),
+        part("Rear telephoto camera", cams.get("BackTeleCameraModuleSerialNumString")),
+        part("Front camera", cams.get("FrontCameraModuleSerialNumString")),
+    ] if r]))
+
+    face = [part("Infrared camera", cams.get("FrontIRCameraModuleSerialNumString")),
+            part("Dot projector", cams.get("FrontIRStructuredLightProjectorSerialNumString")),
+            part("Flood illuminator / proximity", product.get("rosaline-serial-num") or prox.get("SerialNumber"))]
+    st = pearl.get("PearlSelfTestResult")
+    if st is not None:
+        face.append(("Self-test", "" if st == 0 else f"code {st}", "pass" if st == 0 else "fail"))
+    groups.append(("Face ID", [r for r in face if r]))
+
+    groups.append(("Sensors", [r for r in [
+        part("Ambient light sensor", product.get("ambient-light-sensor-serial-num")),
+    ] if r]))
+    return [(g, rows) for g, rows in groups if rows]
+
+
+class HardwareWindow(Adw.Window):
+    """Every part's serial number, like 3uTools' verification report."""
+
+    def __init__(self, parent, udid, info, smart):
+        super().__init__(transient_for=parent, title="Hardware check", default_width=600, default_height=int(os.environ.get("IPHONE_TOOLS_HW_H", "800")))
+        self.udid, self.info, self.smart = udid, info, smart
+        self.groups = []
+
+        self.toasts = Adw.ToastOverlay()
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(title="Hardware check",
+                                                subtitle=f"{info.get('DeviceName', 'iPhone')} · "
+                                                         f"{MODELS.get(info.get('ProductType', ''), 'iPhone')}"))
+        self.spinner = Gtk.Spinner()
+        header.pack_start(self.spinner)
+        self.copy_btn = Gtk.Button(icon_name="edit-copy-symbolic", tooltip_text="Copy report", sensitive=False)
+        self.copy_btn.connect("clicked", self.copy_report)
+        header.pack_end(self.copy_btn)
+        view.add_top_bar(header)
+
+        clamp = Adw.Clamp(maximum_size=620)
+        self.col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                           margin_top=14, margin_bottom=24, margin_start=16, margin_end=16)
+        clamp.set_child(self.col)
+        self.sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.sc.set_child(clamp)
+        view.set_content(self.sc)
+        self.toasts.set_child(view)
+        self.set_content(self.toasts)
+
+        self.loading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=60)
+        self.loading.append(Gtk.Spinner(spinning=True, width_request=32, height_request=32))
+        self.loading.append(Gtk.Label(label="Reading every part…", css_classes=["dim-label"]))
+        self.col.append(self.loading)
+        self.spinner.start()
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        groups = read_hardware(self.udid, self.info, self.smart)
+        GLib.idle_add(self._show, groups)
+
+    def _show(self, groups):
+        self.spinner.stop()
+        self.col.remove(self.loading)
+        self.groups = groups
+        parts = [r for _, rows in groups for r in rows if r[2] in ("ok", "missing")]
+        missing = [r[0] for r in parts if r[2] == "missing"]
+        failed = [r[0] for _, rows in groups for r in rows if r[2] == "fail"]
+
+        # verdict
+        bad = bool(missing or failed)
+        v = Gtk.Box(spacing=14, css_classes=["verdict", "verdict-warn" if bad else "verdict-ok"])
+        v.append(Gtk.Label(label="!" if bad else "✓", css_classes=["verdict-icon"], valign=Gtk.Align.CENTER))
+        t = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3, hexpand=True)
+        if bad:
+            what = ", ".join(n.lower() for n in missing + failed)
+            head = f"{len(parts) - len(missing)} of {len(parts)} parts report a serial number"
+            body = (f"No serial number from: {what}. That usually means the part was replaced "
+                    "with a non-original one.")
+        else:
+            head = f"All {len(parts)} parts report a serial number"
+            body = "Every part answered with its own serial number."
+        t.append(Gtk.Label(label=head, xalign=0, wrap=True, css_classes=["section-title"]))
+        t.append(Gtk.Label(label=body, xalign=0, wrap=True, css_classes=["caption"]))
+        v.append(t)
+        self.col.append(revealer(v))
+
+        sections = []
+        for title, rows in groups:
+            g = Adw.PreferencesGroup(title=title)
+            for name, value, kind in rows:
+                r = Adw.ActionRow(title=name, use_markup=False)
+                r.add_suffix(Gtk.Label(label=value, selectable=True, xalign=1, valign=Gtk.Align.CENTER,
+                                       css_classes=["dim-label", "numeric"]))
+                if kind in ("ok", "missing", "pass", "fail"):
+                    good = kind in ("ok", "pass")
+                    label = {"ok": "✓ Serial", "missing": "No serial", "pass": "✓ Passed", "fail": "Failed"}[kind]
+                    r.add_suffix(Gtk.Label(label=label, valign=Gtk.Align.CENTER,
+                                           css_classes=["status", "status-ok" if good else "status-warn"]))
+                g.add(r)
+            sections.append(revealer(g))
+
+        note = Gtk.Label(wrap=True, xalign=0, css_classes=["caption", "dim-label", "hw-note"], label=(
+            "These serial numbers are read from the parts themselves. 3uTools also compares them with "
+            "Apple’s factory records, which aren’t available to other apps. For Apple’s own verdict on "
+            "each part, open Settings → General → About → Parts and Service History on the iPhone."))
+        sections.append(revealer(note))
+        for s in sections:
+            self.col.append(s)
+        stagger_reveal([self.col.get_first_child()] + sections, step_ms=70)
+        self.copy_btn.set_sensitive(True)
+        if os.environ.get("IPHONE_TOOLS_HW_SCROLL"):  # developer aid: screenshot the bottom of the report
+            GLib.timeout_add(1500, lambda: self.sc.get_vadjustment().set_value(1e6))
+        return False
+
+    def copy_report(self, *_):
+        lines = [f"Hardware check — {self.info.get('DeviceName', 'iPhone')} "
+                 f"({MODELS.get(self.info.get('ProductType', ''), '')}, iOS {self.info.get('ProductVersion', '?')})"]
+        for title, rows in self.groups:
+            lines.append(f"\n{title}")
+            for name, value, kind in rows:
+                flag = {"ok": "", "pass": "", "missing": "  [no serial]", "fail": "  [failed]"}.get(kind, "")
+                lines.append(f"  {name}: {value or ('passed' if kind == 'pass' else '')}{flag}")
+        Gdk.Display.get_default().get_clipboard().set("\n".join(lines))
+        self.toasts.add_toast(Adw.Toast(title="Report copied to clipboard", timeout=3))
+
+
 def wifi_name():
     rc, out, _ = run(["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"], timeout=5)
     for line in out.decode(errors="replace").splitlines():
@@ -1215,7 +1422,16 @@ class Window(Adw.ApplicationWindow):
         mb.append(Gtk.Label(label="Mirror screen"))
         mirror.set_child(mb)
         mirror.connect("clicked", self.open_mirror)
-        txt.append(mirror)
+        hw = Gtk.Button(css_classes=["flat", "mirror-pill"], halign=Gtk.Align.START, margin_top=4)
+        hb = Gtk.Box(spacing=7)
+        hb.append(Gtk.Image(icon_name="emblem-ok-symbolic"))
+        hb.append(Gtk.Label(label="Hardware check"))
+        hw.set_child(hb)
+        hw.connect("clicked", self.open_hardware)
+        pills = Gtk.Box(spacing=8)
+        pills.append(mirror)
+        pills.append(hw)
+        txt.append(pills)
         hero.append(txt)
 
         # gauges
@@ -1446,6 +1662,8 @@ class Window(Adw.ApplicationWindow):
             stagger_reveal(self.sections)
             if os.environ.get("IPHONE_TOOLS_OPEN") == "music" and not getattr(self, "music_win", None):
                 GLib.timeout_add(600, lambda: (self.open_music(), False)[1])  # developer aid
+            if os.environ.get("IPHONE_TOOLS_OPEN") == "hardware" and not getattr(self, "hw_win", None):
+                GLib.timeout_add(600, lambda: (self.open_hardware(), False)[1])  # developer aid
             if os.environ.get("IPHONE_TOOLS_OPEN") == "mirror" and not getattr(self, "mirror_win", None):
                 GLib.timeout_add(600, lambda: (self.open_mirror(), False)[1])  # developer aid
         return False
@@ -1493,6 +1711,16 @@ class Window(Adw.ApplicationWindow):
             return
         self.mirror_win = MirrorWindow(self)  # works over Wi-Fi, no USB needed
         self.mirror_win.present()
+
+    def open_hardware(self, *_):
+        if not self.need_device():
+            return
+        win = getattr(self, "hw_win", None)
+        if win and win.get_visible() and win.udid == self.udid:
+            win.present()
+            return
+        self.hw_win = HardwareWindow(self, self.udid, self.data["info"], self.data["smart"])
+        self.hw_win.present()
 
     def open_music(self, *_):
         if not self.need_device():
@@ -1686,7 +1914,8 @@ class App(Adw.Application):
             GLib.timeout_add(int(os.environ.get("IPHONE_TOOLS_SHOT_MS", "4500")), self._shot, win, shot)
 
     def _shot(self, win, path):
-        win = getattr(win, "music_win", None) or getattr(win, "mirror_win", None) or win
+        win = (getattr(win, "music_win", None) or getattr(win, "mirror_win", None)
+               or getattr(win, "hw_win", None) or win)
         w, h = win.get_width(), win.get_height()
         paintable = Gtk.WidgetPaintable(widget=win)
         snap = Gtk.Snapshot()
