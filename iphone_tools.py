@@ -8,6 +8,7 @@ import plistlib
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 
@@ -19,28 +20,12 @@ gi.require_version("Gsk", "4.0")
 gi.require_version("Graphene", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango  # noqa: E402
 
-APP_ID = "local.iphonetools"
-BACKUP_DIR = os.path.expanduser("~/iPhone Backups")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # find itools/ also when run with python3 -I
+from itools import battery as battery_history  # noqa: E402
+from itools.common import (  # noqa: E402
+    APP_ID, BACKUP_DIR, BLUE, GREEN, GREY, MODELS, ORANGE, PURPLE, RED, YELLOW,
+    AppDocs, gb, pmd3, revealer, rgba, run, share_apps, stagger_reveal, themed)
 
-# Apple system colours (dark appearance)
-GREEN, ORANGE, RED = "#30D158", "#FF9F0A", "#FF453A"
-BLUE, PURPLE, GREY, YELLOW = "#0A84FF", "#BF5AF2", "#8E8E93", "#FFD60A"
-
-MODELS = {
-    "iPhone10,1": "iPhone 8", "iPhone10,4": "iPhone 8", "iPhone10,2": "iPhone 8 Plus", "iPhone10,5": "iPhone 8 Plus",
-    "iPhone10,3": "iPhone X", "iPhone10,6": "iPhone X", "iPhone11,2": "iPhone XS", "iPhone11,4": "iPhone XS Max",
-    "iPhone11,6": "iPhone XS Max", "iPhone11,8": "iPhone XR", "iPhone12,1": "iPhone 11", "iPhone12,3": "iPhone 11 Pro",
-    "iPhone12,5": "iPhone 11 Pro Max", "iPhone12,8": "iPhone SE (2nd gen)", "iPhone13,1": "iPhone 12 mini",
-    "iPhone13,2": "iPhone 12", "iPhone13,3": "iPhone 12 Pro", "iPhone13,4": "iPhone 12 Pro Max",
-    "iPhone14,4": "iPhone 13 mini", "iPhone14,5": "iPhone 13", "iPhone14,2": "iPhone 13 Pro",
-    "iPhone14,3": "iPhone 13 Pro Max", "iPhone14,6": "iPhone SE (3rd gen)", "iPhone14,7": "iPhone 14",
-    "iPhone14,8": "iPhone 14 Plus", "iPhone15,2": "iPhone 14 Pro", "iPhone15,3": "iPhone 14 Pro Max",
-    "iPhone15,4": "iPhone 15", "iPhone15,5": "iPhone 15 Plus", "iPhone16,1": "iPhone 15 Pro",
-    "iPhone16,2": "iPhone 15 Pro Max", "iPhone17,3": "iPhone 16", "iPhone17,4": "iPhone 16 Plus",
-    "iPhone17,1": "iPhone 16 Pro", "iPhone17,2": "iPhone 16 Pro Max", "iPhone17,5": "iPhone 16e",
-    "iPhone18,3": "iPhone 17", "iPhone18,1": "iPhone 17 Pro", "iPhone18,2": "iPhone 17 Pro Max",
-    "iPhone18,4": "iPhone Air",
-}
 
 CSS = f"""
 .hero {{
@@ -163,7 +148,26 @@ button.flat.mirror-pill:hover {{ background: alpha(white, 0.34); }}
 .status-ok {{ color: {GREEN}; background: alpha({GREEN}, 0.15); }}
 .status-warn {{ color: {ORANGE}; background: alpha({ORANGE}, 0.17); }}
 .hw-note {{ padding: 0 4px; }}
+.stat-value {{ font-size: 1.6em; font-weight: 800; }}
+.stat-green {{ color: {GREEN}; }}
+.stat-orange {{ color: {ORANGE}; }}
+.stat-red {{ color: {RED}; }}
+.sev-crash {{ color: {RED}; }}
+.sev-warn {{ color: {ORANGE}; }}
+.sev-info {{ color: {GREY}; }}
+.log-view {{ font-size: 0.85em; }}
 """
+
+# Tool windows: (tile title, icon, module in itools/, window class taking (parent, udid), needs the iPhone)
+TOOLS = [
+    ("Import photos", "folder-pictures", "photos", "PhotoImportWindow", True),
+    ("Apps", "application-x-executable", "apps", "AppsWindow", True),
+    ("Battery history", "battery-full-charged", "battery", "BatteryHistoryWindow", True),
+    ("Crash reports", "utilities-system-monitor", "logs", "LogsWindow", True),
+    ("Videos to iPhone", "video-x-generic", "videos", "VideosWindow", True),
+    ("Backup browser", "drive-harddisk", "backups", "BackupsWindow", False),
+    ("Export chats", "mail-send", "export", "ExportWindow", False),
+]
 
 # Apps that read songs from their "iTunes File Sharing" folder, with how to see them on the phone.
 KNOWN_MUSIC_APPS = {
@@ -173,60 +177,10 @@ KNOWN_MUSIC_APPS = {
     "org.videolan.vlc-ios": ("vlc", "Songs appear in VLC’s Audio tab."),
 }
 AUDIO_EXT = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".aif", ".aiff", ".alac", ".ogg", ".opus", ".mp4"}
-MOUNT_DIR = os.path.expanduser("~/.cache/iphone-tools/mnt")
 MIRROR_NAME = "iPhone Tools"              # name shown in the iPhone's Screen Mirroring list
 MIRROR_PORT = 47800                       # local-only (127.0.0.1) handoff from uxplay to this app
 SHOTS_DIR = os.path.expanduser("~/Pictures/iPhone Screenshots")
 MIRROR_LOG = os.path.expanduser("~/.cache/iphone-tools/uxplay.log")
-
-
-def rgba(colour, alpha=1.0):
-    """'#RRGGBB' or a Gdk.RGBA -> Gdk.RGBA with the given alpha."""
-    c = Gdk.RGBA()
-    if isinstance(colour, Gdk.RGBA):
-        c.red, c.green, c.blue = colour.red, colour.green, colour.blue
-    else:
-        c.parse(colour)
-    c.alpha = alpha
-    return c
-
-
-# Icons that only some themes have (e.g. WhiteSur) get fallbacks; "iphone-tools" ships with the app.
-ICON_FALLBACKS = {
-    "phone-apple-iphone": ["phone-apple-iphone", "iphone-tools"],
-    "org.gnome.Music": ["org.gnome.Music", "multimedia-audio-player", "audio-x-generic"],
-    "deja-dup": ["deja-dup", "org.gnome.DejaDup", "document-save"],
-    "spotify": ["spotify", "spotify-client", "org.gnome.Music", "audio-x-generic"],
-    "vlc": ["vlc", "org.videolan.VLC", "multimedia-video-player", "audio-x-generic"],
-}
-
-
-def themed(name):
-    """A GIcon that tries `name` first, then sensible fallbacks, so the app looks right on any icon theme."""
-    names = ICON_FALLBACKS.get(name, [name])
-    if name == "phone-apple-iphone":
-        # Pick explicitly, because GTK searches the whole system theme for every fallback name before
-        # hicolor: a full-colour theme iPhone (e.g. WhiteSur) > our own icon (installed, or the SVG next to
-        # this file when running from a fresh clone). Stock Adwaita only has a flat -symbolic outline.
-        theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
-        if _full_colour(theme, "phone-apple-iphone"):
-            return Gio.ThemedIcon.new("phone-apple-iphone")
-        if theme.has_icon("iphone-tools"):
-            return Gio.ThemedIcon.new("iphone-tools")
-        local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "iphone-tools.svg")
-        if os.path.exists(local):
-            return Gio.FileIcon.new(Gio.File.new_for_path(local))
-    return Gio.ThemedIcon.new_from_names(names)
-
-
-def _full_colour(theme, name):
-    """True if the theme has a real colour icon for `name` (not just a monochrome -symbolic variant)."""
-    if not theme.has_icon(name):
-        return False
-    paintable = theme.lookup_icon(name, None, 128, 1, Gtk.TextDirection.LTR, 0)
-    f = paintable.get_file()
-    where = (f.get_path() or f.get_uri() or "") if f else ""
-    return bool(where) and "-symbolic" not in where
 
 
 def pt(x, y):
@@ -255,14 +209,6 @@ def round_stroke(width):
     s = Gsk.Stroke.new(width)
     s.set_line_cap(Gsk.LineCap.ROUND)
     return s
-
-
-def run(args, timeout=20):
-    try:
-        p = subprocess.run(args, capture_output=True, timeout=timeout)
-        return p.returncode, p.stdout, p.stderr.decode(errors="replace")
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        return 1, b"", str(e)
 
 
 def iphone_on_usb():
@@ -300,10 +246,6 @@ def parse_info(raw):
         k, v = line.split(": ", 1)
         out[k.strip()] = v.strip()
     return out
-
-
-def gb(n):
-    return f"{int(n) / 1e9:.1f} GB"
 
 
 def read_device(udid):
@@ -435,54 +377,13 @@ class StorageBar(Gtk.Widget):
         snap.pop()
 
 
-def stagger_reveal(revealers, step_ms=110):
-    for i, r in enumerate(revealers):
-        r.set_reveal_child(False)
-        GLib.timeout_add(60 + i * step_ms, lambda rv=r: (rv.set_reveal_child(True), False)[1])
-
-
-def revealer(child):
-    r = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN, transition_duration=420)
-    r.set_child(child)
-    return r
-
-
 # ---------------------------------------------------------------- music (app file sharing)
 def list_share_apps(udid):
-    """Apps on the phone that accept files from a computer: [(bundle_id, name)]."""
-    rc, out, _ = run(["ifuse", "-u", udid, "--list-apps"], timeout=30)
-    apps = []
-    for line in out.decode(errors="replace").splitlines():
-        m = re.match(r'\s*([^,]+),\s*"[^"]*",\s*"(.*)"\s*$', line)
-        if m and m.group(1) != "CFBundleIdentifier":
-            apps.append((m.group(1).strip(), m.group(2)))
+    """Apps on the phone that accept files from a computer: [(bundle_id, name)], music players first."""
+    apps = share_apps(udid)
     # known music players first, Spotify at the top
     apps.sort(key=lambda a: (a[0] not in KNOWN_MUSIC_APPS, a[0] != "com.spotify.client", a[1].lower()))
     return apps
-
-
-class AppDocs:
-    """`with AppDocs(udid, app_id) as path:` mounts an app's Documents folder via ifuse."""
-
-    def __init__(self, udid, app_id):
-        self.udid, self.app_id, self.path = udid, app_id, MOUNT_DIR
-
-    def __enter__(self):
-        os.makedirs(self.path, exist_ok=True)
-        subprocess.run(["fusermount", "-uz", self.path], capture_output=True)  # clear a stale mount
-        rc, _, err = run(["ifuse", "-u", self.udid, "--documents", self.app_id, self.path], timeout=30)
-        if rc != 0:
-            raise RuntimeError(err.strip() or "Could not open the app folder on the iPhone")
-        return self.path
-
-    def __exit__(self, *exc):
-        for _ in range(5):
-            if subprocess.run(["fusermount", "-u", self.path], capture_output=True).returncode == 0:
-                break
-            time.sleep(0.4)
-        else:
-            subprocess.run(["fusermount", "-uz", self.path], capture_output=True)
-        return False
 
 
 def collect_audio(paths):
@@ -1311,6 +1212,7 @@ class Window(Adw.ApplicationWindow):
         self.busy = False
         self.backup_proc = None
         self.backup_started = time.time()
+        self.tool_wins = {}
 
         self.toasts = Adw.ToastOverlay()
         view = Adw.ToolbarView()
@@ -1338,6 +1240,10 @@ class Window(Adw.ApplicationWindow):
 
         self.refresh()
         GLib.timeout_add_seconds(3, self.poll)
+        dev = os.environ.get("IPHONE_TOOLS_OPEN", "")
+        if dev.startswith(("tool:backups:", "tool:export:")):  # developer aid: no iPhone needed
+            _, m, c = dev.split(":")
+            GLib.timeout_add(600, lambda: (self.open_tool(m, c), False)[1])
 
     # ---------- layout ----------
     def build_empty(self):
@@ -1360,6 +1266,9 @@ class Window(Adw.ApplicationWindow):
         self.repair_btn.connect("clicked", self.repair)
         self.repair_rev = revealer(self.repair_btn)
         box.append(self.repair_rev)
+        browse = Gtk.Button(label="Browse backups", halign=Gtk.Align.CENTER, margin_top=18, css_classes=["pill"])
+        browse.connect("clicked", lambda *_: self.open_tool("backups", "BackupsWindow"))
+        box.append(browse)
         return box
 
     def repair(self, *_):
@@ -1519,6 +1428,20 @@ class Window(Adw.ApplicationWindow):
             flow.append(btn)
         acard.append(flow)
 
+        # tools (each opens its own window; modules are imported only when used)
+        tcard = self.card("Tools")
+        tflow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
+                            min_children_per_line=3, max_children_per_line=3, column_spacing=10, row_spacing=10)
+        for title, icon, module, cls, _needs in TOOLS:
+            btn = Gtk.Button(css_classes=["flat", "tile"])
+            b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            b.append(Gtk.Image(gicon=themed(icon), pixel_size=40))
+            b.append(Gtk.Label(label=title, css_classes=["caption-heading"]))
+            btn.set_child(b)
+            btn.connect("clicked", lambda _b, m=module, c=cls: self.open_tool(m, c))
+            tflow.append(btn)
+        tcard.append(tflow)
+
         # details
         details = Adw.PreferencesGroup(title="Details")
         self.fields = {}
@@ -1535,7 +1458,7 @@ class Window(Adw.ApplicationWindow):
             details.add(r)
             self.fields[key] = lbl
 
-        self.sections = [revealer(w) for w in (hero, gcard, scard, acard, details)]
+        self.sections = [revealer(w) for w in (hero, gcard, scard, acard, tcard, details)]
         col.append(self.sections[0])
         col.append(self.sections[1])
         col.append(self.backup_rev)
@@ -1592,6 +1515,10 @@ class Window(Adw.ApplicationWindow):
         self.repair_rev.set_reveal_child(False)
 
         i, b, dk, s = data["info"], data["battery"], data["disk"], data["smart"]
+        try:
+            battery_history.record(udid, s)
+        except OSError:
+            pass  # history is a bonus; never block the main view
         ptype = i.get("ProductType", "")
         model = MODELS.get(ptype, ptype or "iPhone")
         self.wtitle.set_subtitle(f"{model} connected")
@@ -1662,6 +1589,10 @@ class Window(Adw.ApplicationWindow):
             stagger_reveal(self.sections)
             if os.environ.get("IPHONE_TOOLS_OPEN") == "music" and not getattr(self, "music_win", None):
                 GLib.timeout_add(600, lambda: (self.open_music(), False)[1])  # developer aid
+            dev = os.environ.get("IPHONE_TOOLS_OPEN", "")
+            if dev.startswith("tool:") and not self.tool_wins:
+                _, m, c = dev.split(":")
+                GLib.timeout_add(600, lambda: (self.open_tool(m, c), False)[1])  # developer aid
             if os.environ.get("IPHONE_TOOLS_OPEN") == "hardware" and not getattr(self, "hw_win", None):
                 GLib.timeout_add(600, lambda: (self.open_hardware(), False)[1])  # developer aid
             if os.environ.get("IPHONE_TOOLS_OPEN") == "mirror" and not getattr(self, "mirror_win", None):
@@ -1721,6 +1652,21 @@ class Window(Adw.ApplicationWindow):
             return
         self.hw_win = HardwareWindow(self, self.udid, self.data["info"], self.data["smart"])
         self.hw_win.present()
+
+    def open_tool(self, module, cls):
+        """Open a tool window from itools/<module>.py (one window per tool, re-presented if already open)."""
+        needs = next((t[4] for t in TOOLS if t[3] == cls), True)
+        if needs and not self.need_device():
+            return
+        win = self.tool_wins.get(cls)
+        if win and win.get_visible() and getattr(win, "udid", None) == self.udid:
+            win.present()
+            return
+        import importlib
+        mod = importlib.import_module(f"itools.{module}")
+        win = getattr(mod, cls)(self, self.udid)
+        self.tool_wins[cls] = win
+        win.present()
 
     def open_music(self, *_):
         if not self.need_device():
@@ -1811,9 +1757,9 @@ class Window(Adw.ApplicationWindow):
         os.makedirs(BACKUP_DIR, exist_ok=True)
         # pymobiledevice3 works on iOS 17+ and is incremental after the first backup;
         # libimobiledevice 1.3's idevicebackup2 hangs at "Requesting backup" on iOS 26.
-        pmd3 = shutil.which("pymobiledevice3") or os.path.expanduser("~/.local/bin/pymobiledevice3")
-        if os.path.exists(pmd3):
-            cmd = [pmd3, "backup2", "backup", BACKUP_DIR]
+        tool = pmd3()
+        if tool:
+            cmd = [tool, "backup2", "backup", BACKUP_DIR]
         else:
             cmd = ["idevicebackup2", "-u", self.udid, "backup", "--full", BACKUP_DIR]
         try:
@@ -1915,7 +1861,7 @@ class App(Adw.Application):
 
     def _shot(self, win, path):
         win = (getattr(win, "music_win", None) or getattr(win, "mirror_win", None)
-               or getattr(win, "hw_win", None) or win)
+               or getattr(win, "hw_win", None) or next(iter(getattr(win, "tool_wins", {}).values()), None) or win)
         w, h = win.get_width(), win.get_height()
         paintable = Gtk.WidgetPaintable(widget=win)
         snap = Gtk.Snapshot()

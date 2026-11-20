@@ -56,10 +56,19 @@ fi
 if ! command -v pymobiledevice3 >/dev/null && [ ! -x "$HOME/.local/bin/pymobiledevice3" ]; then
   optional+=("Backups on iOS 17+: sudo apt install -y pipx && pipx install pymobiledevice3")
 fi
+if ! have_gst x264enc || { ! have_gst avenc_aac && ! have_gst voaacenc; }; then
+  optional+=("Videos to iPhone: sudo apt install -y gstreamer1.0-plugins-ugly gstreamer1.0-libav")
+fi
+if ! ls /usr/lib/*/libheif/plugins/*de265* >/dev/null 2>&1; then
+  optional+=("HEIC photos → JPG:  sudo apt install -y libheif-plugin-libde265")
+fi
 
 # --- install
 mkdir -p "$APP_DIR" "$(dirname "$DESKTOP")" "$(dirname "$ICON")"
 install -m 755 iphone_tools.py "$APP_DIR/iphone_tools.py"
+rm -rf "$APP_DIR/itools"
+mkdir -p "$APP_DIR/itools"
+install -m 644 itools/*.py "$APP_DIR/itools/"
 install -m 644 data/iphone-tools.svg "$ICON"
 gtk-update-icon-cache -q -t -f "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 
